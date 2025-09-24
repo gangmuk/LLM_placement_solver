@@ -8,16 +8,16 @@
     "d_hidden": 11008
   },
   "solution": {
-    "objective_value": 435.04,
+    "objective_value": 301.42400003026705,
     "gpu_assignments": [
       {
         "gpu_type": "H100",
-        "gpu_id": 1,
-        "global_gpu_id": 9,
+        "gpu_id": 0,
+        "global_gpu_id": 8,
         "start_layer": 1,
         "end_layer": 12,
         "segment_size": 12,
-        "throughput": 435.04
+        "throughput": 301.424
       }
     ],
     "network_connections": [],

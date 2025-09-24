@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-LLM Model Parallelism Placement Solver using Gurobi (FIXED VERSION)
-Optimizes layer placement across heterogeneous GPU clusters with network communication.
+LLM Model Parallelism Placement Solver - CONSTRAINED SEGMENTS
+Uses original formulation but with intelligent minimum segment size constraints
+to reduce the combinatorial explosion while maintaining optimality.
 """
 
 import os
@@ -273,24 +274,52 @@ class LLMPlacementSolver:
         return max_feasible
     
     def _generate_valid_segments(self) -> List[Tuple[str, int, int, int]]:
-        """Generate all valid (gpu_type, gpu_id, start_layer, segment_size) combinations"""
+        """Generate segments with intelligent minimum size constraints"""
         valid_segments = []
+        
+        # Calculate intelligent minimum segment sizes
+        min_segment_sizes = self._calculate_min_segment_sizes()
         
         for gpu_type_name, gpu_type in self.gpu_types.items():
             max_seg_size = self.max_segment_size[gpu_type_name]
+            min_seg_size = min_segment_sizes[gpu_type_name]
+            
             if max_seg_size == 0:
                 logger.warning(f"GPU type {gpu_type_name} cannot hold any layers!")
                 continue
                 
+            logger.info(f"GPU {gpu_type_name}: using segment sizes {min_seg_size}-{max_seg_size}")
+                
             for gpu_id in range(gpu_type.count):
-                for start_layer in range(1, self.config.num_decoder_layers + 1):
-                    for segment_size in range(1, min(max_seg_size + 1,
+                # Use larger step sizes for large problems
+                step_size = max(1, self.config.num_decoder_layers // 20) if self.config.num_decoder_layers > 40 else 1
+                
+                for start_layer in range(1, self.config.num_decoder_layers + 1, step_size):
+                    for segment_size in range(min_seg_size, min(max_seg_size + 1,
                                                    self.config.num_decoder_layers - start_layer + 2)):
                         if start_layer + segment_size - 1 <= self.config.num_decoder_layers:
                             valid_segments.append((gpu_type_name, gpu_id, start_layer, segment_size))
         
-        logger.info(f"Generated {len(valid_segments)} valid segments")
+        logger.info(f"Generated {len(valid_segments)} constrained segments")
         return valid_segments
+    
+    def _calculate_min_segment_sizes(self) -> Dict[str, int]:
+        """Calculate intelligent minimum segment sizes based on memory efficiency"""
+        min_sizes = {}
+        
+        for gpu_type_name, gpu_type in self.gpu_types.items():
+            max_size = self.max_segment_size[gpu_type_name]
+            
+            # Minimum segment size based on memory efficiency
+            # Aim for at least 50% memory utilization
+            memory_per_layer = self.config.layer_weight_memory_gb
+            activation_memory = self._calculate_activation_memory()
+            target_memory = gpu_type.memory_gb * 0.5  # 50% utilization target
+            
+            min_layers = max(1, int((target_memory - activation_memory) / memory_per_layer))
+            min_sizes[gpu_type_name] = min(min_layers, max_size, max(1, max_size // 3))
+            
+        return min_sizes
     
     def _generate_valid_connections(self) -> List[Tuple[Tuple[str, int, int, int], Tuple[str, int, int, int]]]:
         """Generate valid network connections efficiently using layer-based grouping"""

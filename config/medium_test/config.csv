@@ -8,5 +8,5 @@ d_hidden,22016
 vocab_size,32000
 num_attention_heads,64
 layer_weight_memory_gb,3.5
-time_limit_seconds,300
+time_limit_seconds,120
 optimality_gap,0.05

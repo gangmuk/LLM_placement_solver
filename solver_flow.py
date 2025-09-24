@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-LLM Model Parallelism Placement Solver using Gurobi (FIXED VERSION)
-Optimizes layer placement across heterogeneous GPU clusters with network communication.
+LLM Model Parallelism Placement Solver - FLOW-BASED REFORMULATION
+Uses layer assignment variables instead of segment variables for better scalability.
+Variables: x[gpu, layer] instead of x[gpu, start_layer, segment_size]
 """
 
 import os
@@ -108,8 +109,8 @@ class ThroughputFunctions:
         
         return weight_memory + total_intermediate
 
-class LLMPlacementSolver:
-    """Main solver class for LLM placement optimization"""
+class LLMPlacementFlowSolver:
+    """Flow-based solver using layer assignment variables for better scalability"""
 
     def __init__(self, config_dir: str):
         self.options = {
@@ -140,16 +141,13 @@ class LLMPlacementSolver:
                            f"does not match total GPU count ({self.total_gpus})")
         
         self.max_segment_size = self._compute_max_segment_sizes()
-        self.valid_segments = self._generate_valid_segments()
-        self.valid_connections = self._generate_valid_connections()
         self.gpu_pair_throughputs = self._precompute_network_throughputs()
         
-        # Validate problem size
-        self._validate_problem_size()
+        # Validate flow-based problem size
+        self._validate_flow_problem_size()
         
-        logger.info(f"Initialized solver: {len(self.gpu_types)} GPU types, {self.total_gpus} total GPUs")
+        logger.info(f"Initialized flow-based solver: {len(self.gpu_types)} GPU types, {self.total_gpus} total GPUs")
         logger.info(f"Model: {self.config.num_decoder_layers} layers, batch_size={self.config.batch_size}")
-        logger.info(f"Problem size: {len(self.valid_segments)} segments, {len(self.valid_connections)} connections")
     
     def _load_gpu_pool(self, filename: str) -> Dict[str, GPUType]:
         """Load GPU pool configuration"""
@@ -432,6 +430,27 @@ class LLMPlacementSolver:
         logger.info(f"  2. Use only high-memory GPUs for this workload")
         logger.info(f"  3. Consider model sharding across fewer, larger segments")
     
+    def _validate_flow_problem_size(self):
+        """Validate flow-based problem size"""
+        num_layer_vars = self.total_gpus * self.config.num_decoder_layers
+        num_flow_vars = self.total_gpus * (self.total_gpus - 1) * (self.config.num_decoder_layers - 1)
+        total_binary_vars = num_layer_vars + num_flow_vars + self.total_gpus
+        
+        logger.info(f"Flow-based problem size:")
+        logger.info(f"  - Layer assignment vars: {num_layer_vars}")
+        logger.info(f"  - Network flow vars: {num_flow_vars}")
+        logger.info(f"  - Total binary variables: {total_binary_vars}")
+        
+        if total_binary_vars > 100000:
+            logger.warning(f"Large flow-based problem ({total_binary_vars} variables). May take time to solve.")
+        else:
+            logger.info(f"Flow-based problem should be tractable.")
+        
+        # Compare to segment-based approach
+        estimated_segments = sum(self.max_segment_size[gpu_type] * gpu_obj.count * self.config.num_decoder_layers 
+                               for gpu_type, gpu_obj in self.gpu_types.items()) // 4  # Rough estimate
+        logger.info(f"Estimated segment-based variables would be: ~{estimated_segments * 20} (much larger)")
+    
     def build_model(self):
         """Build the Gurobi optimization model"""
         logger.info("Building optimization model...")
@@ -458,12 +477,15 @@ class LLMPlacementSolver:
         logger.info("Model built successfully")
     
     def _create_variables(self):
-        """Create decision variables"""
-        # Segment assignment variables: x[gpu_type, gpu_id, start_layer, segment_size]
+        """Create decision variables using flow-based formulation"""
+        # FLOW-BASED: Layer assignment variables x[gpu_type, gpu_id, layer]
         self.x = self.model.addVars(
-            self.valid_segments,
+            [(gpu_type, gpu_id, layer) 
+             for gpu_type, gpu_type_obj in self.gpu_types.items()
+             for gpu_id in range(gpu_type_obj.count)
+             for layer in range(1, self.config.num_decoder_layers + 1)],
             vtype=GRB.BINARY,
-            name="segment_assignment"
+            name="layer_assignment"
         )
         
         # GPU usage indicators: z[gpu_type, gpu_id]
@@ -474,14 +496,20 @@ class LLMPlacementSolver:
             name="gpu_usage"
         )
         
-        # Network connection variables: e[seg1, seg2]
-        self.e = self.model.addVars(
-            self.valid_connections,
+        # FLOW-BASED: Network flow variables for consecutive layers
+        self.flow = self.model.addVars(
+            [(gpu_type1, gpu_id1, gpu_type2, gpu_id2, layer)
+             for layer in range(1, self.config.num_decoder_layers)  # Flow between layer and layer+1
+             for gpu_type1, gpu_obj1 in self.gpu_types.items()
+             for gpu_id1 in range(gpu_obj1.count)
+             for gpu_type2, gpu_obj2 in self.gpu_types.items()
+             for gpu_id2 in range(gpu_obj2.count)
+             if not (gpu_type1 == gpu_type2 and gpu_id1 == gpu_id2)],
             vtype=GRB.BINARY,
-            name="network_connection"
+            name="network_flow"
         )
         
-        # Throughput variables
+        # GPU throughput variables
         self.tau = self.model.addVars(
             [(gpu_type, gpu_id) for gpu_type, gpu_type_obj in self.gpu_types.items() 
              for gpu_id in range(gpu_type_obj.count)],
@@ -490,8 +518,15 @@ class LLMPlacementSolver:
             name="gpu_throughput"
         )
         
+        # Network throughput variables (per flow)
         self.rho = self.model.addVars(
-            self.valid_connections,
+            [(gpu_type1, gpu_id1, gpu_type2, gpu_id2, layer)
+             for layer in range(1, self.config.num_decoder_layers)
+             for gpu_type1, gpu_obj1 in self.gpu_types.items()
+             for gpu_id1 in range(gpu_obj1.count)
+             for gpu_type2, gpu_obj2 in self.gpu_types.items()
+             for gpu_id2 in range(gpu_obj2.count)
+             if not (gpu_type1 == gpu_type2 and gpu_id1 == gpu_id2)],
             vtype=GRB.CONTINUOUS,
             lb=0,
             name="network_throughput"
@@ -499,85 +534,126 @@ class LLMPlacementSolver:
         
         # End-to-end throughput
         self.t = self.model.addVar(vtype=GRB.CONTINUOUS, lb=0, name="end_to_end_throughput")
+        
+        logger.info(f"Flow-based variables created:")
+        logger.info(f"  - Layer assignments: {len(self.x)}")
+        logger.info(f"  - Network flows: {len(self.flow)}")
+        logger.info(f"  - Total binary variables: {len(self.x) + len(self.flow) + len(self.z)}")
     
     def _create_constraints(self):
-        """Create optimization constraints - FIXED"""
+        """Create flow-based constraints"""
         
-        # 1. Layer coverage: each layer assigned exactly once
+        # 1. Layer coverage: each layer assigned to exactly one GPU
         for layer in range(1, self.config.num_decoder_layers + 1):
             self.model.addConstr(
-                gp.quicksum(self.x[seg] for seg in self.valid_segments 
-                           if seg[2] <= layer <= seg[2] + seg[3] - 1) == 1,
+                gp.quicksum(self.x[gpu_type, gpu_id, layer]
+                           for gpu_type, gpu_type_obj in self.gpu_types.items()
+                           for gpu_id in range(gpu_type_obj.count)) == 1,
                 name=f"layer_coverage_{layer}"
             )
         
-        # 2. GPU capacity: each GPU processes at most one segment
+        # 2. Memory constraints: total layers per GPU must not exceed memory capacity
         for gpu_type, gpu_type_obj in self.gpu_types.items():
+            max_layers = self.max_segment_size[gpu_type]
             for gpu_id in range(gpu_type_obj.count):
                 self.model.addConstr(
-                    gp.quicksum(self.x[seg] for seg in self.valid_segments 
-                               if seg[0] == gpu_type and seg[1] == gpu_id) <= 1,
-                    name=f"gpu_capacity_{gpu_type}_{gpu_id}"
+                    gp.quicksum(self.x[gpu_type, gpu_id, layer]
+                               for layer in range(1, self.config.num_decoder_layers + 1)) <= max_layers,
+                    name=f"memory_capacity_{gpu_type}_{gpu_id}"
                 )
         
         # 3. GPU usage indicators
         for gpu_type, gpu_type_obj in self.gpu_types.items():
             for gpu_id in range(gpu_type_obj.count):
                 self.model.addConstr(
-                    self.z[gpu_type, gpu_id] == 
-                    gp.quicksum(self.x[seg] for seg in self.valid_segments 
-                               if seg[0] == gpu_type and seg[1] == gpu_id),
+                    self.z[gpu_type, gpu_id] >= (1.0 / self.config.num_decoder_layers) *
+                    gp.quicksum(self.x[gpu_type, gpu_id, layer]
+                               for layer in range(1, self.config.num_decoder_layers + 1)),
                     name=f"gpu_usage_{gpu_type}_{gpu_id}"
                 )
         
-        # 4. Network connection constraints
-        for (seg1, seg2) in self.valid_connections:
-            # Connection exists if both segments are selected
-            self.model.addConstr(
-                self.e[seg1, seg2] <= self.x[seg1],
-                name=f"connection_seg1"
-            )
-            self.model.addConstr(
-                self.e[seg1, seg2] <= self.x[seg2],
-                name=f"connection_seg2"
-            )
-            self.model.addConstr(
-                self.e[seg1, seg2] >= self.x[seg1] + self.x[seg2] - 1,
-                name=f"connection_both"
-            )
-        
-        # 5. GPU throughput definition
+        # 4. Consecutive layer constraints: layers on same GPU must be consecutive
         for gpu_type, gpu_type_obj in self.gpu_types.items():
             for gpu_id in range(gpu_type_obj.count):
-                gpu_throughput_expr = gp.quicksum(
-                    ThroughputFunctions.gpu_throughput(
-                        gpu_type, self.config.sequence_length, 
-                        self.config.batch_size, seg[3]
-                    ) * self.x[seg]
-                    for seg in self.valid_segments 
-                    if seg[0] == gpu_type and seg[1] == gpu_id
+                for layer in range(2, self.config.num_decoder_layers - 1):  # FIXED: -1 to avoid out of bounds
+                    # If layer L and L+2 are on same GPU, then L+1 must also be on same GPU
+                    self.model.addConstr(
+                        self.x[gpu_type, gpu_id, layer] + self.x[gpu_type, gpu_id, layer + 2] - 1 
+                        <= self.x[gpu_type, gpu_id, layer + 1],
+                        name=f"consecutive_{gpu_type}_{gpu_id}_{layer}"
+                    )
+        
+        # 5. Network flow constraints: flow exists if layers are on different GPUs
+        for layer in range(1, self.config.num_decoder_layers):
+            for gpu_type1, gpu_obj1 in self.gpu_types.items():
+                for gpu_id1 in range(gpu_obj1.count):
+                    for gpu_type2, gpu_obj2 in self.gpu_types.items():
+                        for gpu_id2 in range(gpu_obj2.count):
+                            if gpu_type1 == gpu_type2 and gpu_id1 == gpu_id2:
+                                continue
+                            
+                            # Flow exists if layer L is on gpu1 and layer L+1 is on gpu2
+                            self.model.addConstr(
+                                self.flow[gpu_type1, gpu_id1, gpu_type2, gpu_id2, layer] >=
+                                self.x[gpu_type1, gpu_id1, layer] + self.x[gpu_type2, gpu_id2, layer + 1] - 1,
+                                name=f"flow_def_{gpu_type1}_{gpu_id1}_{gpu_type2}_{gpu_id2}_{layer}"
+                            )
+                            
+                            # Flow cannot exist without both layers
+                            self.model.addConstr(
+                                self.flow[gpu_type1, gpu_id1, gpu_type2, gpu_id2, layer] <=
+                                self.x[gpu_type1, gpu_id1, layer],
+                                name=f"flow_src_{gpu_type1}_{gpu_id1}_{gpu_type2}_{gpu_id2}_{layer}"
+                            )
+                            
+                            self.model.addConstr(
+                                self.flow[gpu_type1, gpu_id1, gpu_type2, gpu_id2, layer] <=
+                                self.x[gpu_type2, gpu_id2, layer + 1],
+                                name=f"flow_dst_{gpu_type1}_{gpu_id1}_{gpu_type2}_{gpu_id2}_{layer}"
+                            )
+        
+        # 6. GPU throughput definition (flow-based)
+        for gpu_type, gpu_type_obj in self.gpu_types.items():
+            for gpu_id in range(gpu_type_obj.count):
+                # Count layers assigned to this GPU
+                layers_assigned = gp.quicksum(
+                    self.x[gpu_type, gpu_id, layer]
+                    for layer in range(1, self.config.num_decoder_layers + 1)
                 )
+                
+                # Throughput based on number of layers assigned
+                # Use average throughput per layer for this GPU type
+                avg_throughput_per_layer = ThroughputFunctions.gpu_throughput(
+                    gpu_type, self.config.sequence_length, 
+                    self.config.batch_size, 1  # Per layer
+                )
+                
                 self.model.addConstr(
-                    self.tau[gpu_type, gpu_id] == gpu_throughput_expr,
+                    self.tau[gpu_type, gpu_id] == avg_throughput_per_layer * layers_assigned,
                     name=f"gpu_throughput_def_{gpu_type}_{gpu_id}"
                 )
         
-        # 6. Network throughput definition using precomputed values
-        for (seg1, seg2) in self.valid_connections:
-            gpu_type1, gpu_id1 = seg1[0], seg1[1]
-            gpu_type2, gpu_id2 = seg2[0], seg2[1]
-            
-            # Use precomputed throughput
-            net_throughput = self.gpu_pair_throughputs.get(
-                ((gpu_type1, gpu_id1), (gpu_type2, gpu_id2)), 100.0
-            )
-            
-            self.model.addConstr(
-                self.rho[seg1, seg2] == net_throughput * self.e[seg1, seg2],
-                name=f"network_throughput_def"
-            )
+        # 7. Network throughput definition (flow-based)
+        for layer in range(1, self.config.num_decoder_layers):
+            for gpu_type1, gpu_obj1 in self.gpu_types.items():
+                for gpu_id1 in range(gpu_obj1.count):
+                    for gpu_type2, gpu_obj2 in self.gpu_types.items():
+                        for gpu_id2 in range(gpu_obj2.count):
+                            if gpu_type1 == gpu_type2 and gpu_id1 == gpu_id2:
+                                continue
+                            
+                            # Use precomputed throughput for this GPU pair
+                            net_throughput = self.gpu_pair_throughputs.get(
+                                ((gpu_type1, gpu_id1), (gpu_type2, gpu_id2)), 100.0
+                            )
+                            
+                            self.model.addConstr(
+                                self.rho[gpu_type1, gpu_id1, gpu_type2, gpu_id2, layer] == 
+                                net_throughput * self.flow[gpu_type1, gpu_id1, gpu_type2, gpu_id2, layer],
+                                name=f"network_throughput_def_{gpu_type1}_{gpu_id1}_{gpu_type2}_{gpu_id2}_{layer}"
+                            )
         
-        # 7. End-to-end throughput constraints
+        # 8. End-to-end throughput constraints (flow-based)
         # Compute Big-M intelligently based on max possible throughputs
         max_gpu_throughput = max(
             ThroughputFunctions.gpu_throughput(gpu_type, self.config.sequence_length,
@@ -597,51 +673,29 @@ class LLMPlacementSolver:
                     name=f"throughput_gpu_{gpu_type}_{gpu_id}"
                 )
 
-        # Network throughput constraints - only for active connections
-        for (seg1, seg2) in self.valid_connections:
-            self.model.addConstr(
-                self.t <= self.rho[seg1, seg2] + M * (1 - self.e[seg1, seg2]),
-                name=f"throughput_network"
-            )
-
-        # 8. FIXED: Pipeline connectivity constraints
-        # Ensure pipeline starts at layer 1
-        first_layer_segments = [seg for seg in self.valid_segments if seg[2] == 1]
-        if first_layer_segments:
-            self.model.addConstr(
-                gp.quicksum(self.x[seg] for seg in first_layer_segments) >= 1,
-                name="pipeline_starts_at_layer_1"
-            )
-
-        # FIXED: Only enforce connectivity for non-terminal layers
+        # Network throughput constraints - only for active flows
         for layer in range(1, self.config.num_decoder_layers):
-            # Find segments ending at this layer
-            segments_ending_here = [seg for seg in self.valid_segments
-                                  if seg[2] + seg[3] - 1 == layer]
-            # Find segments starting at next layer
-            segments_starting_next = [seg for seg in self.valid_segments
-                                    if seg[2] == layer + 1]
+            for gpu_type1, gpu_obj1 in self.gpu_types.items():
+                for gpu_id1 in range(gpu_obj1.count):
+                    for gpu_type2, gpu_obj2 in self.gpu_types.items():
+                        for gpu_id2 in range(gpu_obj2.count):
+                            if gpu_type1 == gpu_type2 and gpu_id1 == gpu_id2:
+                                continue
+                            
+                            self.model.addConstr(
+                                self.t <= self.rho[gpu_type1, gpu_id1, gpu_type2, gpu_id2, layer] + 
+                                M * (1 - self.flow[gpu_type1, gpu_id1, gpu_type2, gpu_id2, layer]),
+                                name=f"throughput_network_{gpu_type1}_{gpu_id1}_{gpu_type2}_{gpu_id2}_{layer}"
+                            )
 
-            if segments_ending_here and segments_starting_next:
-                # If a segment ends at layer i, there must be a connection to layer i+1
-                for seg1 in segments_ending_here:
-                    valid_next_connections = [(s1, s2) for (s1, s2) in self.valid_connections 
-                                            if s1 == seg1 and s2 in segments_starting_next]
-                    if valid_next_connections:
-                        self.model.addConstr(
-                            gp.quicksum(self.e[s1, s2] for (s1, s2) in valid_next_connections) >= self.x[seg1],
-                            name=f"connectivity_out_{layer}"
-                        )
-
-                # If a segment starts at layer i+1, there must be a connection from layer i
-                for seg2 in segments_starting_next:
-                    valid_prev_connections = [(s1, s2) for (s1, s2) in self.valid_connections 
-                                            if s2 == seg2 and s1 in segments_ending_here]
-                    if valid_prev_connections:
-                        self.model.addConstr(
-                            gp.quicksum(self.e[s1, s2] for (s1, s2) in valid_prev_connections) >= self.x[seg2],
-                            name=f"connectivity_in_{layer}"
-                        )
+        # 9. Pipeline connectivity constraints (flow-based)
+        # Ensure pipeline starts at layer 1
+        self.model.addConstr(
+            gp.quicksum(self.x[gpu_type, gpu_id, 1]
+                       for gpu_type, gpu_type_obj in self.gpu_types.items()
+                       for gpu_id in range(gpu_type_obj.count)) >= 1,
+            name="pipeline_starts_at_layer_1"
+        )
     
     def _set_objective(self):
         """Set optimization objective"""
@@ -680,7 +734,7 @@ class LLMPlacementSolver:
             return False
     
     def _extract_solution(self):
-        """Extract solution from solved model"""
+        """Extract solution from solved flow-based model"""
         self.solution = {
             'objective_value': self.t.x,
             'gpu_assignments': [],
@@ -688,35 +742,73 @@ class LLMPlacementSolver:
             'solve_status': self.model.status
         }
         
-        # Extract GPU assignments
-        for seg in self.valid_segments:
-            if self.x[seg].x > 0.5:  # Binary variable is 1
-                gpu_type, gpu_id, start_layer, segment_size = seg
-                global_gpu_id = self._get_global_gpu_id(gpu_type, gpu_id)
+        # Extract layer assignments and group into segments
+        layer_assignments = {}
+        for gpu_type, gpu_type_obj in self.gpu_types.items():
+            for gpu_id in range(gpu_type_obj.count):
+                layers = []
+                for layer in range(1, self.config.num_decoder_layers + 1):
+                    if self.x[gpu_type, gpu_id, layer].x > 0.5:
+                        layers.append(layer)
                 
-                assignment = {
-                    'gpu_type': gpu_type,
-                    'gpu_id': gpu_id,
-                    'global_gpu_id': global_gpu_id,
-                    'start_layer': start_layer,
-                    'end_layer': start_layer + segment_size - 1,
-                    'segment_size': segment_size,
-                    'throughput': self.tau[gpu_type, gpu_id].x
-                }
-                self.solution['gpu_assignments'].append(assignment)
+                if layers:
+                    # Group consecutive layers into segments
+                    segments = self._group_consecutive_layers(layers)
+                    global_gpu_id = self._get_global_gpu_id(gpu_type, gpu_id)
+                    
+                    for start_layer, end_layer in segments:
+                        assignment = {
+                            'gpu_type': gpu_type,
+                            'gpu_id': gpu_id,
+                            'global_gpu_id': global_gpu_id,
+                            'start_layer': start_layer,
+                            'end_layer': end_layer,
+                            'segment_size': end_layer - start_layer + 1,
+                            'throughput': self.tau[gpu_type, gpu_id].x
+                        }
+                        self.solution['gpu_assignments'].append(assignment)
         
-        # Extract network connections
-        for (seg1, seg2) in self.valid_connections:
-            if self.e[seg1, seg2].x > 0.5:  # Binary variable is 1
-                connection = {
-                    'from_segment': seg1,
-                    'to_segment': seg2,
-                    'throughput': self.rho[seg1, seg2].x
-                }
-                self.solution['network_connections'].append(connection)
+        # Extract network flows
+        for layer in range(1, self.config.num_decoder_layers):
+            for gpu_type1, gpu_obj1 in self.gpu_types.items():
+                for gpu_id1 in range(gpu_obj1.count):
+                    for gpu_type2, gpu_obj2 in self.gpu_types.items():
+                        for gpu_id2 in range(gpu_obj2.count):
+                            if gpu_type1 == gpu_type2 and gpu_id1 == gpu_id2:
+                                continue
+                            
+                            if self.flow[gpu_type1, gpu_id1, gpu_type2, gpu_id2, layer].x > 0.5:
+                                connection = {
+                                    'from_gpu': (gpu_type1, gpu_id1),
+                                    'to_gpu': (gpu_type2, gpu_id2),
+                                    'layer_boundary': layer,
+                                    'throughput': self.rho[gpu_type1, gpu_id1, gpu_type2, gpu_id2, layer].x
+                                }
+                                self.solution['network_connections'].append(connection)
         
         # Sort assignments by start layer
         self.solution['gpu_assignments'].sort(key=lambda x: x['start_layer'])
+    
+    def _group_consecutive_layers(self, layers):
+        """Group consecutive layers into segments"""
+        if not layers:
+            return []
+        
+        layers.sort()
+        segments = []
+        start = layers[0]
+        end = layers[0]
+        
+        for i in range(1, len(layers)):
+            if layers[i] == end + 1:
+                end = layers[i]
+            else:
+                segments.append((start, end))
+                start = layers[i]
+                end = layers[i]
+        
+        segments.append((start, end))
+        return segments
     
     def print_solution(self):
         """Print the solution in a readable format"""
@@ -779,7 +871,7 @@ class LLMPlacementSolver:
 
 def main():
     """Main function for command line usage"""
-    parser = argparse.ArgumentParser(description='LLM Model Parallelism Placement Optimizer')
+    parser = argparse.ArgumentParser(description='LLM Model Parallelism Placement Optimizer - Flow-Based')
     parser.add_argument('--config-dir', required=True, help='Configuration directory containing all CSV files')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose logging')
     
@@ -789,8 +881,8 @@ def main():
         logging.getLogger().setLevel(logging.DEBUG)
     
     try:
-        # Initialize solver
-        solver = LLMPlacementSolver(args.config_dir)
+        # Initialize flow-based solver
+        solver = LLMPlacementFlowSolver(args.config_dir)
         
         # Build and solve model
         solver.build_model()

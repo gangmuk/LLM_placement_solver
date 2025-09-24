@@ -1,0 +1,53 @@
+{
+  "config": {
+    "model_name": "llama-13b",
+    "num_decoder_layers": 20,
+    "sequence_length": 2048,
+    "batch_size": 16,
+    "d_model": 4096,
+    "d_hidden": 11008
+  },
+  "solution": {
+    "objective_value": 93.664,
+    "gpu_assignments": [
+      {
+        "gpu_type": "A10",
+        "gpu_id": 0,
+        "global_gpu_id": 4,
+        "start_layer": 1,
+        "end_layer": 5,
+        "segment_size": 5,
+        "throughput": 93.664
+      },
+      {
+        "gpu_type": "A10",
+        "gpu_id": 0,
+        "global_gpu_id": 4,
+        "start_layer": 6,
+        "end_layer": 10,
+        "segment_size": 5,
+        "throughput": 93.664
+      },
+      {
+        "gpu_type": "A10",
+        "gpu_id": 0,
+        "global_gpu_id": 4,
+        "start_layer": 11,
+        "end_layer": 15,
+        "segment_size": 5,
+        "throughput": 93.664
+      },
+      {
+        "gpu_type": "A10",
+        "gpu_id": 0,
+        "global_gpu_id": 4,
+        "start_layer": 16,
+        "end_layer": 20,
+        "segment_size": 5,
+        "throughput": 93.664
+      }
+    ],
+    "network_connections": [],
+    "solve_status": "OPTIMAL"
+  }
+}
