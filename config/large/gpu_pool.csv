@@ -1,0 +1,5 @@
+gpu_type,count,memory_gb
+A100,8,80
+V100,6,32
+H100,4,80
+RTX4090,10,24

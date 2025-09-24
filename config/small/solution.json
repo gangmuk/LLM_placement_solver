@@ -1,0 +1,26 @@
+{
+  "config": {
+    "model_name": "llama-7b",
+    "num_decoder_layers": 12,
+    "sequence_length": 2048,
+    "batch_size": 16,
+    "d_model": 4096,
+    "d_hidden": 11008
+  },
+  "solution": {
+    "objective_value": 435.04,
+    "gpu_assignments": [
+      {
+        "gpu_type": "H100",
+        "gpu_id": 1,
+        "global_gpu_id": 9,
+        "start_layer": 1,
+        "end_layer": 12,
+        "segment_size": 12,
+        "throughput": 435.04
+      }
+    ],
+    "network_connections": [],
+    "solve_status": 2
+  }
+}
