@@ -10,3 +10,4 @@ num_attention_heads,32
 layer_weight_memory_gb,0.5
 time_limit_seconds,60
 optimality_gap,0.01
+bytes_per_element,2

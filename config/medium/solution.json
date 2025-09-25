@@ -8,95 +8,14 @@
     "d_hidden": 22016
   },
   "solution": {
-    "objective_value": 62.5,
+    "objective_value": 169.232,
     "gpu_assignments": [
-      {
-        "gpu_type": "L20",
-        "gpu_id": 1,
-        "global_gpu_id": 6,
-        "start_layer": 1,
-        "end_layer": 4,
-        "segment_size": 4,
-        "throughput": 218.336
-      },
-      {
-        "gpu_type": "L20",
-        "gpu_id": 2,
-        "global_gpu_id": 7,
-        "start_layer": 5,
-        "end_layer": 8,
-        "segment_size": 4,
-        "throughput": 218.336
-      },
-      {
-        "gpu_type": "L20",
-        "gpu_id": 3,
-        "global_gpu_id": 8,
-        "start_layer": 9,
-        "end_layer": 12,
-        "segment_size": 4,
-        "throughput": 218.336
-      },
-      {
-        "gpu_type": "L20",
-        "gpu_id": 4,
-        "global_gpu_id": 9,
-        "start_layer": 13,
-        "end_layer": 16,
-        "segment_size": 4,
-        "throughput": 218.336
-      },
-      {
-        "gpu_type": "L20",
-        "gpu_id": 5,
-        "global_gpu_id": 10,
-        "start_layer": 17,
-        "end_layer": 20,
-        "segment_size": 4,
-        "throughput": 218.336
-      },
-      {
-        "gpu_type": "L20",
-        "gpu_id": 6,
-        "global_gpu_id": 11,
-        "start_layer": 21,
-        "end_layer": 24,
-        "segment_size": 4,
-        "throughput": 218.336
-      },
-      {
-        "gpu_type": "L20",
-        "gpu_id": 7,
-        "global_gpu_id": 12,
-        "start_layer": 25,
-        "end_layer": 28,
-        "segment_size": 4,
-        "throughput": 218.336
-      },
-      {
-        "gpu_type": "L20",
-        "gpu_id": 8,
-        "global_gpu_id": 13,
-        "start_layer": 29,
-        "end_layer": 32,
-        "segment_size": 4,
-        "throughput": 218.336
-      },
-      {
-        "gpu_type": "L20",
-        "gpu_id": 9,
-        "global_gpu_id": 14,
-        "start_layer": 33,
-        "end_layer": 36,
-        "segment_size": 4,
-        "throughput": 218.336
-      },
       {
         "gpu_type": "A40",
         "gpu_id": 0,
         "global_gpu_id": 25,
-        "start_layer": 37,
-        "end_layer": 40,
+        "start_layer": 1,
+        "end_layer": 4,
         "segment_size": 4,
         "throughput": 254.736
       },
@@ -104,8 +23,8 @@
         "gpu_type": "A40",
         "gpu_id": 1,
         "global_gpu_id": 26,
-        "start_layer": 41,
-        "end_layer": 44,
+        "start_layer": 5,
+        "end_layer": 8,
         "segment_size": 4,
         "throughput": 254.736
       },
@@ -113,8 +32,8 @@
         "gpu_type": "A40",
         "gpu_id": 2,
         "global_gpu_id": 27,
-        "start_layer": 45,
-        "end_layer": 48,
+        "start_layer": 9,
+        "end_layer": 12,
         "segment_size": 4,
         "throughput": 254.736
       },
@@ -122,8 +41,8 @@
         "gpu_type": "A40",
         "gpu_id": 3,
         "global_gpu_id": 28,
-        "start_layer": 49,
-        "end_layer": 52,
+        "start_layer": 13,
+        "end_layer": 16,
         "segment_size": 4,
         "throughput": 254.736
       },
@@ -131,8 +50,8 @@
         "gpu_type": "A40",
         "gpu_id": 4,
         "global_gpu_id": 29,
-        "start_layer": 53,
-        "end_layer": 56,
+        "start_layer": 17,
+        "end_layer": 20,
         "segment_size": 4,
         "throughput": 254.736
       },
@@ -140,8 +59,8 @@
         "gpu_type": "A40",
         "gpu_id": 5,
         "global_gpu_id": 30,
-        "start_layer": 57,
-        "end_layer": 60,
+        "start_layer": 21,
+        "end_layer": 24,
         "segment_size": 4,
         "throughput": 254.736
       },
@@ -149,8 +68,8 @@
         "gpu_type": "A40",
         "gpu_id": 6,
         "global_gpu_id": 31,
-        "start_layer": 61,
-        "end_layer": 64,
+        "start_layer": 25,
+        "end_layer": 28,
         "segment_size": 4,
         "throughput": 254.736
       },
@@ -158,8 +77,8 @@
         "gpu_type": "A40",
         "gpu_id": 7,
         "global_gpu_id": 32,
-        "start_layer": 65,
-        "end_layer": 68,
+        "start_layer": 29,
+        "end_layer": 32,
         "segment_size": 4,
         "throughput": 254.736
       },
@@ -167,315 +86,396 @@
         "gpu_type": "A40",
         "gpu_id": 8,
         "global_gpu_id": 33,
-        "start_layer": 69,
-        "end_layer": 72,
+        "start_layer": 33,
+        "end_layer": 36,
         "segment_size": 4,
         "throughput": 254.736
-      },
-      {
-        "gpu_type": "A100",
-        "gpu_id": 0,
-        "global_gpu_id": 0,
-        "start_layer": 73,
-        "end_layer": 76,
-        "segment_size": 4,
-        "throughput": 277.04
       },
       {
         "gpu_type": "A40",
         "gpu_id": 9,
         "global_gpu_id": 34,
+        "start_layer": 37,
+        "end_layer": 40,
+        "segment_size": 4,
+        "throughput": 254.736
+      },
+      {
+        "gpu_type": "V100",
+        "gpu_id": 0,
+        "global_gpu_id": 55,
+        "start_layer": 41,
+        "end_layer": 44,
+        "segment_size": 4,
+        "throughput": 169.232
+      },
+      {
+        "gpu_type": "V100",
+        "gpu_id": 1,
+        "global_gpu_id": 56,
+        "start_layer": 45,
+        "end_layer": 48,
+        "segment_size": 4,
+        "throughput": 169.232
+      },
+      {
+        "gpu_type": "V100",
+        "gpu_id": 2,
+        "global_gpu_id": 57,
+        "start_layer": 49,
+        "end_layer": 52,
+        "segment_size": 4,
+        "throughput": 169.232
+      },
+      {
+        "gpu_type": "V100",
+        "gpu_id": 3,
+        "global_gpu_id": 58,
+        "start_layer": 53,
+        "end_layer": 56,
+        "segment_size": 4,
+        "throughput": 169.232
+      },
+      {
+        "gpu_type": "V100",
+        "gpu_id": 4,
+        "global_gpu_id": 59,
+        "start_layer": 57,
+        "end_layer": 60,
+        "segment_size": 4,
+        "throughput": 169.232
+      },
+      {
+        "gpu_type": "V100",
+        "gpu_id": 5,
+        "global_gpu_id": 60,
+        "start_layer": 61,
+        "end_layer": 64,
+        "segment_size": 4,
+        "throughput": 169.232
+      },
+      {
+        "gpu_type": "V100",
+        "gpu_id": 6,
+        "global_gpu_id": 61,
+        "start_layer": 65,
+        "end_layer": 68,
+        "segment_size": 4,
+        "throughput": 169.232
+      },
+      {
+        "gpu_type": "V100",
+        "gpu_id": 7,
+        "global_gpu_id": 62,
+        "start_layer": 69,
+        "end_layer": 72,
+        "segment_size": 4,
+        "throughput": 169.232
+      },
+      {
+        "gpu_type": "V100",
+        "gpu_id": 9,
+        "global_gpu_id": 64,
+        "start_layer": 73,
+        "end_layer": 76,
+        "segment_size": 4,
+        "throughput": 169.232
+      },
+      {
+        "gpu_type": "V100",
+        "gpu_id": 8,
+        "global_gpu_id": 63,
         "start_layer": 77,
         "end_layer": 80,
         "segment_size": 4,
-        "throughput": 254.736
+        "throughput": 169.232
       }
     ],
     "network_connections": [
       {
         "from_segment": [
-          "L20",
-          1,
+          "A40",
+          0,
           1,
           4
         ],
         "to_segment": [
-          "L20",
-          2,
+          "A40",
+          1,
           5,
           4
         ],
-        "throughput": 125.0
+        "throughput": 275.0
       },
       {
         "from_segment": [
-          "L20",
-          2,
+          "A40",
+          1,
           5,
           4
         ],
         "to_segment": [
-          "L20",
-          3,
+          "A40",
+          2,
           9,
           4
         ],
-        "throughput": 125.0
+        "throughput": 275.0
       },
       {
         "from_segment": [
-          "L20",
-          3,
+          "A40",
+          2,
           9,
           4
         ],
         "to_segment": [
-          "L20",
-          4,
+          "A40",
+          3,
           13,
           4
         ],
-        "throughput": 125.0
+        "throughput": 275.0
       },
       {
         "from_segment": [
-          "L20",
-          4,
+          "A40",
+          3,
           13,
           4
         ],
         "to_segment": [
-          "L20",
-          5,
-          17,
-          4
-        ],
-        "throughput": 125.0
-      },
-      {
-        "from_segment": [
-          "L20",
-          5,
-          17,
-          4
-        ],
-        "to_segment": [
-          "L20",
-          6,
-          21,
-          4
-        ],
-        "throughput": 125.0
-      },
-      {
-        "from_segment": [
-          "L20",
-          6,
-          21,
-          4
-        ],
-        "to_segment": [
-          "L20",
-          7,
-          25,
-          4
-        ],
-        "throughput": 125.0
-      },
-      {
-        "from_segment": [
-          "L20",
-          7,
-          25,
-          4
-        ],
-        "to_segment": [
-          "L20",
-          8,
-          29,
-          4
-        ],
-        "throughput": 125.0
-      },
-      {
-        "from_segment": [
-          "L20",
-          8,
-          29,
-          4
-        ],
-        "to_segment": [
-          "L20",
-          9,
-          33,
-          4
-        ],
-        "throughput": 125.0
-      },
-      {
-        "from_segment": [
-          "L20",
-          9,
-          33,
-          4
-        ],
-        "to_segment": [
-          "A40",
-          0,
-          37,
-          4
-        ],
-        "throughput": 75.0
-      },
-      {
-        "from_segment": [
-          "A40",
-          0,
-          37,
-          4
-        ],
-        "to_segment": [
-          "A40",
-          1,
-          41,
-          4
-        ],
-        "throughput": 137.5
-      },
-      {
-        "from_segment": [
-          "A40",
-          1,
-          41,
-          4
-        ],
-        "to_segment": [
-          "A40",
-          2,
-          45,
-          4
-        ],
-        "throughput": 137.5
-      },
-      {
-        "from_segment": [
-          "A40",
-          2,
-          45,
-          4
-        ],
-        "to_segment": [
-          "A40",
-          3,
-          49,
-          4
-        ],
-        "throughput": 137.5
-      },
-      {
-        "from_segment": [
-          "A40",
-          3,
-          49,
-          4
-        ],
-        "to_segment": [
           "A40",
           4,
-          53,
+          17,
           4
         ],
-        "throughput": 137.5
+        "throughput": 275.0
       },
       {
         "from_segment": [
           "A40",
           4,
-          53,
+          17,
           4
         ],
         "to_segment": [
           "A40",
           5,
-          57,
+          21,
           4
         ],
-        "throughput": 137.5
+        "throughput": 275.0
       },
       {
         "from_segment": [
           "A40",
           5,
-          57,
+          21,
           4
         ],
         "to_segment": [
           "A40",
           6,
-          61,
+          25,
           4
         ],
-        "throughput": 137.5
+        "throughput": 275.0
       },
       {
         "from_segment": [
           "A40",
           6,
-          61,
+          25,
           4
         ],
         "to_segment": [
           "A40",
           7,
-          65,
+          29,
           4
         ],
-        "throughput": 137.5
+        "throughput": 275.0
       },
       {
         "from_segment": [
           "A40",
           7,
-          65,
+          29,
           4
         ],
         "to_segment": [
           "A40",
           8,
-          69,
+          33,
           4
         ],
-        "throughput": 137.5
+        "throughput": 275.0
       },
       {
         "from_segment": [
           "A40",
           8,
-          69,
-          4
-        ],
-        "to_segment": [
-          "A100",
-          0,
-          73,
-          4
-        ],
-        "throughput": 62.5
-      },
-      {
-        "from_segment": [
-          "A100",
-          0,
-          73,
+          33,
           4
         ],
         "to_segment": [
           "A40",
           9,
+          37,
+          4
+        ],
+        "throughput": 275.0
+      },
+      {
+        "from_segment": [
+          "A40",
+          9,
+          37,
+          4
+        ],
+        "to_segment": [
+          "V100",
+          0,
+          41,
+          4
+        ],
+        "throughput": 300.0
+      },
+      {
+        "from_segment": [
+          "V100",
+          0,
+          41,
+          4
+        ],
+        "to_segment": [
+          "V100",
+          1,
+          45,
+          4
+        ],
+        "throughput": 300.0
+      },
+      {
+        "from_segment": [
+          "V100",
+          1,
+          45,
+          4
+        ],
+        "to_segment": [
+          "V100",
+          2,
+          49,
+          4
+        ],
+        "throughput": 300.0
+      },
+      {
+        "from_segment": [
+          "V100",
+          2,
+          49,
+          4
+        ],
+        "to_segment": [
+          "V100",
+          3,
+          53,
+          4
+        ],
+        "throughput": 300.0
+      },
+      {
+        "from_segment": [
+          "V100",
+          3,
+          53,
+          4
+        ],
+        "to_segment": [
+          "V100",
+          4,
+          57,
+          4
+        ],
+        "throughput": 300.0
+      },
+      {
+        "from_segment": [
+          "V100",
+          4,
+          57,
+          4
+        ],
+        "to_segment": [
+          "V100",
+          5,
+          61,
+          4
+        ],
+        "throughput": 300.0
+      },
+      {
+        "from_segment": [
+          "V100",
+          5,
+          61,
+          4
+        ],
+        "to_segment": [
+          "V100",
+          6,
+          65,
+          4
+        ],
+        "throughput": 300.0
+      },
+      {
+        "from_segment": [
+          "V100",
+          6,
+          65,
+          4
+        ],
+        "to_segment": [
+          "V100",
+          7,
+          69,
+          4
+        ],
+        "throughput": 300.0
+      },
+      {
+        "from_segment": [
+          "V100",
+          7,
+          69,
+          4
+        ],
+        "to_segment": [
+          "V100",
+          9,
+          73,
+          4
+        ],
+        "throughput": 300.0
+      },
+      {
+        "from_segment": [
+          "V100",
+          9,
+          73,
+          4
+        ],
+        "to_segment": [
+          "V100",
+          8,
           77,
           4
         ],
-        "throughput": 62.5
+        "throughput": 300.0
       }
     ],
     "solve_status": 9

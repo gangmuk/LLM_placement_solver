@@ -13,6 +13,7 @@ import numpy as np
 import argparse
 import json
 import logging
+import math
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 import time
@@ -43,6 +44,7 @@ class Config:
     layer_weight_memory_gb: float
     time_limit_seconds: float
     optimality_gap: float
+    bytes_per_element: int = 2  # FP16 by default, can be 4 for FP32
 
 class ThroughputFunctions:
     """Throughput functions with configurable coefficients"""
@@ -87,20 +89,20 @@ class ThroughputFunctions:
     
     @staticmethod
     def memory_usage(seq_len: int, batch_size: int, num_layers: int, layer_weight_gb: float,
-                    d_model: int, d_hidden: int) -> float:
-        """Memory usage in GB - FIXED"""
+                    d_model: int, d_hidden: int, bytes_per_element: int = 2) -> float:
+        """Memory usage in GB - parameterized precision"""
         # Model weights
         weight_memory = num_layers * layer_weight_gb
 
-        # FIXED: Correct intermediate tensor memory calculation
+        # Intermediate tensor memory calculation (parameterized bytes per element)
         # Attention matrix: batch_size × seq_len × seq_len × d_model (for QK^T)
-        attention_memory = batch_size * seq_len * seq_len * d_model * 4 / (1024**3)
+        attention_memory = batch_size * seq_len * seq_len * d_model * bytes_per_element / (1024**3)
         
         # K,V cache: 2 × batch_size × seq_len × d_model
-        kv_cache_memory = 2 * batch_size * seq_len * d_model * 4 / (1024**3)
+        kv_cache_memory = 2 * batch_size * seq_len * d_model * bytes_per_element / (1024**3)
         
         # Hidden states: batch_size × seq_len × d_hidden
-        hidden_memory = batch_size * seq_len * d_hidden * 4 / (1024**3)
+        hidden_memory = batch_size * seq_len * d_hidden * bytes_per_element / (1024**3)
         
         # Intermediate memory per layer (not total - pipeline processing)
         intermediate_memory_per_layer = (attention_memory + kv_cache_memory + hidden_memory) / 1024  # More reasonable
@@ -112,7 +114,9 @@ class ThroughputFunctions:
 class LLMPlacementSolver:
     """Main solver class for LLM placement optimization"""
 
-    def __init__(self, config_dir: str):
+    def __init__(self, config_dir: str, enable_symmetry_breaking: bool = True,
+                 enable_upper_bound: bool = True, enable_tight_bigm: bool = True,
+                 enable_flow_conservation: bool = True):
         self.options = {
             "WLSACCESSID": "790b9c11-45d0-4785-8d99-a5e6414f9321",
             "WLSSECRET": "adef4738-7bf6-41b8-8dfd-d04e23d53e51",
@@ -120,6 +124,12 @@ class LLMPlacementSolver:
         }
         self.env = gp.Env(params=self.options)
         self.config_dir = config_dir
+        
+        # Optimization flags
+        self.enable_symmetry_breaking = enable_symmetry_breaking
+        self.enable_upper_bound = enable_upper_bound
+        self.enable_tight_bigm = enable_tight_bigm
+        self.enable_flow_conservation = enable_flow_conservation
 
         # FIXED: Correct file names
         gpu_pool_file = os.path.join(config_dir, 'gpu_pool.csv')
@@ -186,6 +196,9 @@ class LLMPlacementSolver:
         df = pd.read_csv(filename)
         config_dict = dict(zip(df['parameter'], df['value']))
         
+        # Handle optional bytes_per_element parameter (default to FP16 = 2 bytes)
+        bytes_per_element = int(config_dict.get('bytes_per_element', 2))
+        
         return Config(
             sequence_length=int(config_dict['sequence_length']),
             batch_size=int(config_dict['batch_size']),
@@ -197,7 +210,8 @@ class LLMPlacementSolver:
             num_attention_heads=int(config_dict['num_attention_heads']),
             layer_weight_memory_gb=float(config_dict['layer_weight_memory_gb']),
             time_limit_seconds=float(config_dict['time_limit_seconds']),
-            optimality_gap=float(config_dict['optimality_gap'])
+            optimality_gap=float(config_dict['optimality_gap']),
+            bytes_per_element=bytes_per_element
         )
     
     def _compute_max_segment_sizes(self) -> Dict[str, int]:
@@ -211,7 +225,8 @@ class LLMPlacementSolver:
         # This is per-batch, not per-layer
         activation_memory = self._calculate_activation_memory()
         
-        logger.info(f"Memory analysis for batch_size={self.config.batch_size}, seq_len={self.config.sequence_length}:")
+        precision_name = "FP16" if self.config.bytes_per_element == 2 else "FP32" if self.config.bytes_per_element == 4 else f"{self.config.bytes_per_element}-byte"
+        logger.info(f"Memory analysis for batch_size={self.config.batch_size}, seq_len={self.config.sequence_length} ({precision_name}):")
         logger.info(f"  - Weight memory per layer: {base_memory_per_layer:.2f} GB")
         logger.info(f"  - Activation memory (constant): {activation_memory:.2f} GB")
         
@@ -232,19 +247,19 @@ class LLMPlacementSolver:
         return max_sizes
     
     def _calculate_activation_memory(self) -> float:
-        """Calculate activation memory that doesn't scale with number of layers (FIXED)"""
-        # FIXED: Attention matrices per layer are much smaller - we don't store full seq_len×seq_len
+        """Calculate activation memory that doesn't scale with number of layers"""
+        # Attention matrices per layer are much smaller - we don't store full seq_len×seq_len
         # Only store attention outputs: batch_size × seq_len × d_model
         attention_memory = (self.config.batch_size * self.config.sequence_length * 
-                          self.config.d_model * 4) / (1024**3)
+                          self.config.d_model * self.config.bytes_per_element) / (1024**3)
         
         # K,V cache per layer: 2 × batch_size × seq_len × d_model  
         kv_cache_memory = (2 * self.config.batch_size * self.config.sequence_length * 
-                          self.config.d_model * 4) / (1024**3)
+                          self.config.d_model * self.config.bytes_per_element) / (1024**3)
         
         # Hidden states: batch_size × seq_len × d_hidden (intermediate computation)
         hidden_memory = (self.config.batch_size * self.config.sequence_length * 
-                        self.config.d_hidden * 4) / (1024**3)
+                        self.config.d_hidden * self.config.bytes_per_element) / (1024**3)
         
         # FIXED: Total activation memory is much more reasonable
         total_activation = attention_memory + kv_cache_memory + hidden_memory
@@ -368,9 +383,10 @@ class LLMPlacementSolver:
         
         # Constant tensor size for all layer-to-layer transfers
         tensor_size_gb = (self.config.batch_size * self.config.sequence_length * 
-                         self.config.d_model * 4) / (1024**3)
+                         self.config.d_model * self.config.bytes_per_element) / (1024**3)
         
-        logger.info(f"Tensor size per transfer: {tensor_size_gb:.3f} GB")
+        precision_name = "FP16" if self.config.bytes_per_element == 2 else "FP32" if self.config.bytes_per_element == 4 else f"{self.config.bytes_per_element}-byte"
+        logger.info(f"Tensor size per transfer: {tensor_size_gb:.3f} GB ({precision_name})")
         
         for gpu_type1, gpu_obj1 in self.gpu_types.items():
             for gpu_id1 in range(gpu_obj1.count):
@@ -460,6 +476,62 @@ class LLMPlacementSolver:
         logger.info(f"  1. Set minimum segment size to {suggested_min_size} layers")
         logger.info(f"  2. Use only high-memory GPUs for this workload")
         logger.info(f"  3. Consider model sharding across fewer, larger segments")
+    
+    def _compute_smart_upper_bound(self) -> float:
+        """Compute theoretically achievable upper bound with feasibility check"""
+        best_feasible_throughput = 0
+        
+        for gpu_type, gpu_obj in self.gpu_types.items():
+            max_layers_per_gpu = self.max_segment_size[gpu_type]
+            if max_layers_per_gpu > 0:
+                # Check if this GPU type can handle the full model
+                gpus_needed = math.ceil(self.config.num_decoder_layers / max_layers_per_gpu)
+                
+                if gpus_needed <= gpu_obj.count:  # Feasible with available GPUs
+                    # Best case: all segments have max size
+                    segment_throughput = ThroughputFunctions.gpu_throughput(
+                        gpu_type, self.config.sequence_length,
+                        self.config.batch_size, max_layers_per_gpu
+                    )
+                    best_feasible_throughput = max(best_feasible_throughput, segment_throughput)
+                    logger.info(f"  Upper bound candidate from {gpu_type}: {segment_throughput:.2f} tokens/sec "
+                               f"({gpus_needed} GPUs needed, {gpu_obj.count} available)")
+        
+        return best_feasible_throughput
+    
+    def _compute_tight_bigM(self) -> Tuple[Dict[str, float], float]:
+        """Compute Big-M values for different constraint types"""
+        # FIXED: Big-M values must be large enough to not constrain unused GPUs
+        # The previous "tight" approach created false constraints by using actual throughput values
+        
+        # Calculate a reasonable upper bound for throughput
+        max_possible_throughput = 0
+        for gpu_type in self.gpu_types:
+            if self.max_segment_size[gpu_type] > 0:
+                gpu_max_throughput = ThroughputFunctions.gpu_throughput(
+                    gpu_type, self.config.sequence_length,
+                    self.config.batch_size, self.max_segment_size[gpu_type]
+                )
+                max_possible_throughput = max(max_possible_throughput, gpu_max_throughput)
+        
+        # Use a sufficiently large Big-M (3x the maximum possible throughput)
+        # This ensures unused GPUs don't create false constraints while keeping the problem tractable
+        safe_bigM = max(1000.0, max_possible_throughput * 3)
+        
+        # Use the same safe Big-M for all GPU types to avoid false constraints
+        M_gpu = {gpu_type: safe_bigM for gpu_type in self.gpu_types}
+        
+        # For network constraints: t <= ρ[e] + M*(1-e)
+        M_network = max(self.gpu_pair_throughputs.values()) if self.gpu_pair_throughputs else 1000.0
+        # Network Big-M can be tighter since connections are explicitly modeled
+        M_network = max(safe_bigM, M_network * 2)
+        
+        logger.info(f"Safe Big-M values computed:")
+        logger.info(f"  M_gpu (all types) = {safe_bigM:.2f}")
+        logger.info(f"  M_network = {M_network:.2f}")
+        logger.info("  (Using safe values to prevent false constraints from unused GPUs)")
+        
+        return M_gpu, M_network
     
     def build_model(self):
         """Build the Gurobi optimization model"""
@@ -606,30 +678,35 @@ class LLMPlacementSolver:
                 name=f"network_throughput_def"
             )
         
-        # 7. End-to-end throughput constraints
-        # Compute Big-M intelligently based on max possible throughputs
-        max_gpu_throughput = max(
-            ThroughputFunctions.gpu_throughput(gpu_type, self.config.sequence_length,
-                                             self.config.batch_size, max_size)
-            for gpu_type, max_size in self.max_segment_size.items()
-            if max_size > 0
-        )
-        max_net_throughput = max(self.gpu_pair_throughputs.values()) if self.gpu_pair_throughputs else 1000.0
-        M = max(max_gpu_throughput, max_net_throughput) * 1.1  # 10% buffer
-        logger.info(f"Using computed Big-M value: {M:.2f}")
+        # 7. End-to-end throughput constraints with optimization
+        if self.enable_tight_bigm:
+            M_gpu, M_network = self._compute_tight_bigM()
+        else:
+            # Original approach
+            max_gpu_throughput = max(
+                ThroughputFunctions.gpu_throughput(gpu_type, self.config.sequence_length,
+                                                 self.config.batch_size, max_size)
+                for gpu_type, max_size in self.max_segment_size.items()
+                if max_size > 0
+            )
+            max_net_throughput = max(self.gpu_pair_throughputs.values()) if self.gpu_pair_throughputs else 1000.0
+            M_unified = max(max_gpu_throughput, max_net_throughput) * 1.1  # 10% buffer
+            M_gpu = {gpu_type: M_unified for gpu_type in self.gpu_types}
+            M_network = M_unified
+            logger.info(f"Using unified Big-M value: {M_unified:.2f}")
 
         # GPU throughput constraints - only for used GPUs
         for gpu_type, gpu_type_obj in self.gpu_types.items():
             for gpu_id in range(gpu_type_obj.count):
                 self.model.addConstr(
-                    self.t <= self.tau[gpu_type, gpu_id] + M * (1 - self.z[gpu_type, gpu_id]),
+                    self.t <= self.tau[gpu_type, gpu_id] + M_gpu[gpu_type] * (1 - self.z[gpu_type, gpu_id]),
                     name=f"throughput_gpu_{gpu_type}_{gpu_id}"
                 )
 
         # Network throughput constraints - only for active connections
         for (seg1, seg2) in self.valid_connections:
             self.model.addConstr(
-                self.t <= self.rho[seg1, seg2] + M * (1 - self.e[seg1, seg2]),
+                self.t <= self.rho[seg1, seg2] + M_network * (1 - self.e[seg1, seg2]),
                 name=f"throughput_network"
             )
 
@@ -671,6 +748,78 @@ class LLMPlacementSolver:
                             gp.quicksum(self.e[s1, s2] for (s1, s2) in valid_prev_connections) >= self.x[seg2],
                             name=f"connectivity_in_{layer}"
                         )
+        
+        # OPTIMIZATION CONSTRAINTS
+        logger.info("Adding optimization constraints...")
+        
+        # Add symmetry breaking constraints
+        if self.enable_symmetry_breaking:
+            self._add_symmetry_breaking_constraints()
+        
+        # Add smart upper bound constraint
+        if self.enable_upper_bound:
+            self._add_upper_bound_constraint()
+            
+        # Add flow conservation constraints
+        if self.enable_flow_conservation:
+            self._add_flow_conservation_constraints()
+    
+    def _add_symmetry_breaking_constraints(self):
+        """Add lexicographic ordering for identical GPU types"""
+        logger.info("Adding symmetry breaking constraints...")
+        constraints_added = 0
+        
+        for gpu_type, gpu_obj in self.gpu_types.items():
+            if gpu_obj.count > 1:
+                for i in range(gpu_obj.count - 1):
+                    # Force GPU_i to be used before GPU_{i+1}
+                    self.model.addConstr(
+                        self.z[gpu_type, i] >= self.z[gpu_type, i+1],
+                        name=f"symmetry_break_{gpu_type}_{i}"
+                    )
+                    constraints_added += 1
+        
+        logger.info(f"Added {constraints_added} symmetry breaking constraints")
+    
+    def _add_upper_bound_constraint(self):
+        """Add smart upper bound constraint"""
+        if self.enable_upper_bound:
+            logger.info("Computing smart upper bound...")
+            upper_bound = self._compute_smart_upper_bound()
+            
+            if upper_bound > 0:
+                self.model.addConstr(
+                    self.t <= upper_bound,
+                    name="smart_upper_bound"
+                )
+                logger.info(f"Added smart upper bound constraint: {upper_bound:.2f} tokens/sec")
+            else:
+                logger.warning("Could not compute valid upper bound - constraint not added")
+    
+    def _add_flow_conservation_constraints(self):
+        """Add flow conservation at each layer boundary"""
+        logger.info("Adding flow conservation constraints...")
+        constraints_added = 0
+        
+        for layer in range(1, self.config.num_decoder_layers):
+            # Segments ending at this layer
+            segments_ending = [seg for seg in self.valid_segments 
+                              if seg[2] + seg[3] - 1 == layer]  # end_layer = start + size - 1
+            
+            # Segments starting at next layer  
+            segments_starting = [seg for seg in self.valid_segments
+                               if seg[2] == layer + 1]  # start_layer = layer + 1
+            
+            if segments_ending and segments_starting:
+                # Flow conservation: outgoing segments = incoming segments
+                self.model.addConstr(
+                    gp.quicksum(self.x[seg] for seg in segments_ending) ==
+                    gp.quicksum(self.x[seg] for seg in segments_starting),
+                    name=f"flow_conservation_{layer}"
+                )
+                constraints_added += 1
+        
+        logger.info(f"Added {constraints_added} flow conservation constraints")
     
     def _set_objective(self):
         """Set optimization objective"""
@@ -808,18 +957,62 @@ class LLMPlacementSolver:
 
 def main():
     """Main function for command line usage"""
-    parser = argparse.ArgumentParser(description='LLM Model Parallelism Placement Optimizer')
+    parser = argparse.ArgumentParser(description='LLM Model Parallelism Placement Optimizer - Optimized')
     parser.add_argument('--config-dir', required=True, help='Configuration directory containing all CSV files')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose logging')
+    parser.add_argument('--bytes-per-element', type=int, choices=[1, 2, 4], 
+                       help='Bytes per tensor element (1=FP8, 2=FP16, 4=FP32). Overrides config file setting.')
+    
+    # Optimization flags
+    parser.add_argument('--enable-symmetry-breaking', action='store_true', default=True,
+                       help='Enable symmetry breaking constraints (default: True)')
+    parser.add_argument('--disable-symmetry-breaking', dest='enable_symmetry_breaking', action='store_false',
+                       help='Disable symmetry breaking constraints')
+    parser.add_argument('--enable-upper-bound', action='store_true', default=True,
+                       help='Enable smart upper bound constraint (default: True)')
+    parser.add_argument('--disable-upper-bound', dest='enable_upper_bound', action='store_false',
+                       help='Disable smart upper bound constraint')
+    parser.add_argument('--enable-tight-bigm', action='store_true', default=True,
+                       help='Enable tighter Big-M computation (default: True)')
+    parser.add_argument('--disable-tight-bigm', dest='enable_tight_bigm', action='store_false',
+                       help='Disable tighter Big-M computation')
+    parser.add_argument('--enable-flow-conservation', action='store_true', default=True,
+                       help='Enable flow conservation constraints (default: True)')
+    parser.add_argument('--disable-flow-conservation', dest='enable_flow_conservation', action='store_false',
+                       help='Disable flow conservation constraints')
     
     args = parser.parse_args()
     
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
     
+    # Log optimization settings
+    logger.info("Optimization settings:")
+    logger.info(f"  - Symmetry breaking: {args.enable_symmetry_breaking}")
+    logger.info(f"  - Smart upper bound: {args.enable_upper_bound}")
+    logger.info(f"  - Tight Big-M: {args.enable_tight_bigm}")
+    logger.info(f"  - Flow conservation: {args.enable_flow_conservation}")
+    
     try:
-        # Initialize solver
-        solver = LLMPlacementSolver(args.config_dir)
+        # Initialize solver with optimization flags
+        solver = LLMPlacementSolver(
+            args.config_dir,
+            enable_symmetry_breaking=args.enable_symmetry_breaking,
+            enable_upper_bound=args.enable_upper_bound,
+            enable_tight_bigm=args.enable_tight_bigm,
+            enable_flow_conservation=args.enable_flow_conservation
+        )
+        
+        # Override bytes_per_element if specified via command line
+        if args.bytes_per_element is not None:
+            logger.info(f"Overriding bytes_per_element from command line: {args.bytes_per_element}")
+            solver.config.bytes_per_element = args.bytes_per_element
+            # Recalculate memory constraints with new precision
+            solver.max_segment_size = solver._compute_max_segment_sizes()
+            solver.valid_segments = solver._generate_valid_segments()
+            solver.valid_connections = solver._generate_valid_connections()
+            solver.gpu_pair_throughputs = solver._precompute_network_throughputs()
+            solver._validate_problem_size()
         
         # Build and solve model
         solver.build_model()

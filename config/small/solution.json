@@ -8,19 +8,44 @@
     "d_hidden": 11008
   },
   "solution": {
-    "objective_value": 301.42400003026705,
+    "objective_value": 149.61599999999999,
     "gpu_assignments": [
+      {
+        "gpu_type": "H100",
+        "gpu_id": 1,
+        "global_gpu_id": 9,
+        "start_layer": 1,
+        "end_layer": 5,
+        "segment_size": 5,
+        "throughput": 283.924
+      },
       {
         "gpu_type": "H100",
         "gpu_id": 0,
         "global_gpu_id": 8,
-        "start_layer": 1,
+        "start_layer": 6,
         "end_layer": 12,
-        "segment_size": 12,
-        "throughput": 301.424
+        "segment_size": 7,
+        "throughput": 288.924
       }
     ],
-    "network_connections": [],
+    "network_connections": [
+      {
+        "from_segment": [
+          "H100",
+          1,
+          1,
+          5
+        ],
+        "to_segment": [
+          "H100",
+          0,
+          6,
+          7
+        ],
+        "throughput": 600.0
+      }
+    ],
     "solve_status": 2
   }
 }

@@ -535,10 +535,15 @@ class LLMPlacementFlowSolver:
         # End-to-end throughput
         self.t = self.model.addVar(vtype=GRB.CONTINUOUS, lb=0, name="end_to_end_throughput")
         
+        # Count auxiliary layer count variables
+        aux_layer_vars = sum((self.max_segment_size[gpu_type] + 1) * gpu_obj.count 
+                           for gpu_type, gpu_obj in self.gpu_types.items())
+        
         logger.info(f"Flow-based variables created:")
         logger.info(f"  - Layer assignments: {len(self.x)}")
         logger.info(f"  - Network flows: {len(self.flow)}")
-        logger.info(f"  - Total binary variables: {len(self.x) + len(self.flow) + len(self.z)}")
+        logger.info(f"  - Auxiliary layer count vars: {aux_layer_vars}")
+        logger.info(f"  - Total binary variables: {len(self.x) + len(self.flow) + len(self.z) + aux_layer_vars}")
     
     def _create_constraints(self):
         """Create flow-based constraints"""
@@ -612,24 +617,47 @@ class LLMPlacementFlowSolver:
                                 name=f"flow_dst_{gpu_type1}_{gpu_id1}_{gpu_type2}_{gpu_id2}_{layer}"
                             )
         
-        # 6. GPU throughput definition (flow-based)
+        # 6. GPU throughput definition (flow-based) - FIXED
         for gpu_type, gpu_type_obj in self.gpu_types.items():
             for gpu_id in range(gpu_type_obj.count):
-                # Count layers assigned to this GPU
+                # FIXED: Need to handle nonlinear throughput calculation properly
+                # Create auxiliary variables for different possible layer counts
+                max_layers = self.max_segment_size[gpu_type]
+                
+                # Binary variables for exactly k layers assigned
+                layer_count_vars = self.model.addVars(
+                    range(max_layers + 1),
+                    vtype=GRB.BINARY,
+                    name=f"layer_count_{gpu_type}_{gpu_id}"
+                )
+                
+                # Constraint: exactly one layer count is selected
+                self.model.addConstr(
+                    gp.quicksum(layer_count_vars[k] for k in range(max_layers + 1)) == 1,
+                    name=f"layer_count_unique_{gpu_type}_{gpu_id}"
+                )
+                
+                # Constraint: layer count matches actual assignment
                 layers_assigned = gp.quicksum(
                     self.x[gpu_type, gpu_id, layer]
                     for layer in range(1, self.config.num_decoder_layers + 1)
                 )
+                self.model.addConstr(
+                    layers_assigned == gp.quicksum(k * layer_count_vars[k] for k in range(max_layers + 1)),
+                    name=f"layer_count_def_{gpu_type}_{gpu_id}"
+                )
                 
-                # Throughput based on number of layers assigned
-                # Use average throughput per layer for this GPU type
-                avg_throughput_per_layer = ThroughputFunctions.gpu_throughput(
-                    gpu_type, self.config.sequence_length, 
-                    self.config.batch_size, 1  # Per layer
+                # Throughput based on exact layer count (now linear)
+                throughput_expr = gp.quicksum(
+                    ThroughputFunctions.gpu_throughput(
+                        gpu_type, self.config.sequence_length, 
+                        self.config.batch_size, k
+                    ) * layer_count_vars[k]
+                    for k in range(max_layers + 1)
                 )
                 
                 self.model.addConstr(
-                    self.tau[gpu_type, gpu_id] == avg_throughput_per_layer * layers_assigned,
+                    self.tau[gpu_type, gpu_id] == throughput_expr,
                     name=f"gpu_throughput_def_{gpu_type}_{gpu_id}"
                 )
         
