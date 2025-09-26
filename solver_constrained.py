@@ -116,7 +116,8 @@ class LLMPlacementSolver:
 
     def __init__(self, config_dir: str, enable_symmetry_breaking: bool = True,
                  enable_upper_bound: bool = True, enable_tight_bigm: bool = True,
-                 enable_flow_conservation: bool = True):
+                 enable_flow_conservation: bool = True, threads: Optional[int] = None,
+                 max_threads: int = 32):
         self.options = {
             "WLSACCESSID": "790b9c11-45d0-4785-8d99-a5e6414f9321",
             "WLSSECRET": "adef4738-7bf6-41b8-8dfd-d04e23d53e51",
@@ -130,6 +131,8 @@ class LLMPlacementSolver:
         self.enable_upper_bound = enable_upper_bound
         self.enable_tight_bigm = enable_tight_bigm
         self.enable_flow_conservation = enable_flow_conservation
+        self.threads = threads
+        self.max_threads = max_threads
 
         # FIXED: Correct file names
         gpu_pool_file = os.path.join(config_dir, 'gpu_pool.csv')
@@ -542,11 +545,10 @@ class LLMPlacementSolver:
         
         # Optimized solver parameters for large problems
         self.model.setParam('Presolve', 2)              # Aggressive presolving
-        self.model.setParam('Cuts', 1)                  # Moderate cut generation  
+        self.model.setParam('Cuts', 1)                  # Moderate cut generation
         self.model.setParam('Heuristics', 0.05)         # Limited heuristics time
         self.model.setParam('MIPFocus', 1)              # Focus on feasible solutions
         self.model.setParam('NodefileStart', 0.5)       # Use disk for large problems
-        self.model.setParam('Threads', 4)               # Limit threads to avoid memory issues
         self.model.setParam('TimeLimit', self.config.time_limit_seconds)
         self.model.setParam('MIPGap', self.config.optimality_gap)
         self.model.setParam('LogToConsole', 1)
@@ -827,6 +829,26 @@ class LLMPlacementSolver:
     
     def solve(self) -> bool:
         """Solve the optimization problem"""
+        # Set dynamic thread allocation based on problem size
+        total_binary_vars = len(self.valid_segments) + len(self.valid_connections)
+        available_threads = min(self.max_threads, os.cpu_count())  # Respect max_threads setting
+
+        if self.threads is not None:
+            # Manual thread specification
+            threads = min(self.threads, available_threads)
+            logger.info(f"Using manually specified {threads} threads for optimization")
+        else:
+            # Auto-scale threads based on problem complexity
+            if total_binary_vars > 50000:
+                threads = min(available_threads, 16)  # Large problems: use more threads
+            elif total_binary_vars > 10000:
+                threads = min(available_threads, 8)   # Medium problems: moderate threads
+            else:
+                threads = min(available_threads, 4)   # Small problems: fewer threads
+            logger.info(f"Auto-scaling to {threads} threads (available: {available_threads}, problem size: {total_binary_vars})")
+
+        self.model.setParam('Threads', threads)
+
         logger.info("Starting optimization...")
         start_time = time.time()
         
@@ -980,8 +1002,13 @@ def main():
                        help='Enable flow conservation constraints (default: True)')
     parser.add_argument('--disable-flow-conservation', dest='enable_flow_conservation', action='store_false',
                        help='Disable flow conservation constraints')
+    parser.add_argument('--threads', type=int, help='Number of threads to use (default: auto-scaled based on problem size)')
+    parser.add_argument('--max-threads', type=int, default=32,
+                       help='Maximum number of threads to use when auto-scaling (default: 32)')
     
     args = parser.parse_args()
+    
+    start_time = time.time()
     
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -992,6 +1019,11 @@ def main():
     logger.info(f"  - Smart upper bound: {args.enable_upper_bound}")
     logger.info(f"  - Tight Big-M: {args.enable_tight_bigm}")
     logger.info(f"  - Flow conservation: {args.enable_flow_conservation}")
+    if args.threads:
+        logger.info(f"  - Threads: {args.threads} (manual)")
+    else:
+        logger.info(f"  - Threads: auto-scaled (max: {args.max_threads})")
+    
     
     try:
         # Initialize solver with optimization flags
@@ -1000,7 +1032,9 @@ def main():
             enable_symmetry_breaking=args.enable_symmetry_breaking,
             enable_upper_bound=args.enable_upper_bound,
             enable_tight_bigm=args.enable_tight_bigm,
-            enable_flow_conservation=args.enable_flow_conservation
+            enable_flow_conservation=args.enable_flow_conservation,
+            threads=args.threads,
+            max_threads=args.max_threads
         )
         
         # Override bytes_per_element if specified via command line
@@ -1030,7 +1064,8 @@ def main():
     except Exception as e:
         logger.error(f"Solver failed: {e}")
         return 1
-    
+    end_time = time.time()
+    logger.info(f"Solver finished in {end_time - start_time:.0f} seconds")
     return 0
 
 
