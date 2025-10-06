@@ -2,7 +2,7 @@ parameter,value
 sequence_length,4096
 batch_size,32
 model_name,llama-70b
-num_decoder_layers,80
+num_decoder_layers,40
 d_model,8192
 d_hidden,22016
 vocab_size,32000
@@ -11,3 +11,6 @@ layer_weight_memory_gb,3.5
 time_limit_seconds,300
 optimality_gap,0.05
 bytes_per_element,2
+enable_segment_quantization,true
+max_pipeline_stages,8
+min_layers_per_stage,5
