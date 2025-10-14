@@ -964,16 +964,27 @@ class LLMPlacementSolverWithTP:
         """Add symmetry breaking for identical TP partitions"""
         logger.info("Adding symmetry breaking constraints...")
         constraints_added = 0
-        existing_partition_keys = set((seg[0], seg[3]) for seg in self.valid_segments)  # ADD THIS
-        for gpu_type, partitions in self.tp_allocations.items():
-            existing_ids = sorted([pid for (gt, pid) in existing_partition_keys if gt == gpu_type])
-            if len(existing_ids) > 1:
-                for i in range(len(existing_ids) - 1):
-                    self.model.addConstr(
-                        self.z[gpu_type, existing_ids[i]] >= self.z[gpu_type, existing_ids[i+1]],
-                        name=f"symmetry_break_{gpu_type}_{i}"
-                    )
-                    constraints_added += 1
+        existing_partition_keys = set((seg[0], seg[3]) for seg in self.valid_segments)
+        
+        # Group partitions by GPU type AND TP degree (not just GPU type)
+        for gpu_type, allocations in self.tp_allocations.items():
+            # Group by TP degree
+            from collections import defaultdict
+            by_tp = defaultdict(list)
+            for gpu_set, tp_degree, partition_id in allocations:
+                if (gpu_type, partition_id) in existing_partition_keys:
+                    by_tp[tp_degree].append(partition_id)
+            
+            # Apply symmetry breaking ONLY within same TP degree
+            for tp_degree, partition_ids in by_tp.items():
+                sorted_ids = sorted(partition_ids)
+                if len(sorted_ids) > 1:
+                    for i in range(len(sorted_ids) - 1):
+                        self.model.addConstr(
+                            self.z[gpu_type, sorted_ids[i]] >= self.z[gpu_type, sorted_ids[i+1]],
+                            name=f"symmetry_break_{gpu_type}_tp{tp_degree}_{i}"
+                        )
+                        constraints_added += 1
         
         logger.info(f"Added {constraints_added} symmetry breaking constraints")
     

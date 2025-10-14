@@ -12,8 +12,8 @@
   "solution": {
     "objective_value": 8344.650268554688,
     "throughput_tokens_per_sec": 8344.650268554688,
-    "cost_per_hour": 5.6,
-    "cost_per_token": 1.864135111111111e-07,
+    "cost_per_hour": 4.0,
+    "cost_per_token": 1.3315250793650794e-07,
     "meets_cost_threshold": true,
     "tp_configuration": {
       "A100": 8,
@@ -24,246 +24,29 @@
     },
     "gpu_assignments": [
       {
-        "gpu_type": "V100",
+        "gpu_type": "A100",
         "partition_id": 12,
         "gpu_ids": [
           0,
-          1
-        ],
-        "global_gpu_ids": [
-          32,
-          33
-        ],
-        "tp_degree": 2,
-        "start_layer": 1,
-        "end_layer": 5,
-        "segment_size": 5,
-        "throughput": 14184.759213374213
-      },
-      {
-        "gpu_type": "V100",
-        "partition_id": 14,
-        "gpu_ids": [
-          4,
-          5
-        ],
-        "global_gpu_ids": [
-          36,
-          37
-        ],
-        "tp_degree": 2,
-        "start_layer": 6,
-        "end_layer": 10,
-        "segment_size": 5,
-        "throughput": 14184.759213374213
-      },
-      {
-        "gpu_type": "V100",
-        "partition_id": 16,
-        "gpu_ids": [
-          8,
-          9
-        ],
-        "global_gpu_ids": [
-          40,
-          41
-        ],
-        "tp_degree": 2,
-        "start_layer": 11,
-        "end_layer": 15,
-        "segment_size": 5,
-        "throughput": 14184.759213374213
-      },
-      {
-        "gpu_type": "V100",
-        "partition_id": 13,
-        "gpu_ids": [
+          1,
           2,
           3
         ],
         "global_gpu_ids": [
-          34,
-          35
+          0,
+          1,
+          2,
+          3
         ],
-        "tp_degree": 2,
-        "start_layer": 16,
-        "end_layer": 20,
-        "segment_size": 5,
-        "throughput": 14184.759213374213
-      },
-      {
-        "gpu_type": "A100",
-        "partition_id": 1,
-        "gpu_ids": [
-          1
-        ],
-        "global_gpu_ids": [
-          1
-        ],
-        "tp_degree": 1,
-        "start_layer": 21,
-        "end_layer": 25,
-        "segment_size": 5,
-        "throughput": 21457.672119140625
-      },
-      {
-        "gpu_type": "V100",
-        "partition_id": 17,
-        "gpu_ids": [
-          10,
-          11
-        ],
-        "global_gpu_ids": [
-          42,
-          43
-        ],
-        "tp_degree": 2,
-        "start_layer": 26,
-        "end_layer": 30,
-        "segment_size": 5,
-        "throughput": 14184.759213374213
-      },
-      {
-        "gpu_type": "A100",
-        "partition_id": 0,
-        "gpu_ids": [
-          0
-        ],
-        "global_gpu_ids": [
-          0
-        ],
-        "tp_degree": 1,
-        "start_layer": 31,
-        "end_layer": 35,
-        "segment_size": 5,
-        "throughput": 21457.672119140625
-      },
-      {
-        "gpu_type": "V100",
-        "partition_id": 15,
-        "gpu_ids": [
-          6,
-          7
-        ],
-        "global_gpu_ids": [
-          38,
-          39
-        ],
-        "tp_degree": 2,
-        "start_layer": 36,
+        "tp_degree": 4,
+        "start_layer": 1,
         "end_layer": 40,
-        "segment_size": 5,
-        "throughput": 14184.759213374213
+        "segment_size": 40,
+        "throughput": 8583.06884765625
       }
     ],
-    "network_connections": [
-      {
-        "from_segment": {
-          "gpu_type": "V100",
-          "partition_id": 12,
-          "start_layer": 1,
-          "end_layer": 5
-        },
-        "to_segment": {
-          "gpu_type": "V100",
-          "partition_id": 14,
-          "start_layer": 6,
-          "end_layer": 10
-        },
-        "throughput": 18022400.0
-      },
-      {
-        "from_segment": {
-          "gpu_type": "V100",
-          "partition_id": 14,
-          "start_layer": 6,
-          "end_layer": 10
-        },
-        "to_segment": {
-          "gpu_type": "V100",
-          "partition_id": 16,
-          "start_layer": 11,
-          "end_layer": 15
-        },
-        "throughput": 19660800.0
-      },
-      {
-        "from_segment": {
-          "gpu_type": "V100",
-          "partition_id": 16,
-          "start_layer": 11,
-          "end_layer": 15
-        },
-        "to_segment": {
-          "gpu_type": "V100",
-          "partition_id": 13,
-          "start_layer": 16,
-          "end_layer": 20
-        },
-        "throughput": 19660800.0
-      },
-      {
-        "from_segment": {
-          "gpu_type": "V100",
-          "partition_id": 13,
-          "start_layer": 16,
-          "end_layer": 20
-        },
-        "to_segment": {
-          "gpu_type": "A100",
-          "partition_id": 1,
-          "start_layer": 21,
-          "end_layer": 25
-        },
-        "throughput": 19660800.0
-      },
-      {
-        "from_segment": {
-          "gpu_type": "A100",
-          "partition_id": 1,
-          "start_layer": 21,
-          "end_layer": 25
-        },
-        "to_segment": {
-          "gpu_type": "V100",
-          "partition_id": 17,
-          "start_layer": 26,
-          "end_layer": 30
-        },
-        "throughput": 19660800.0
-      },
-      {
-        "from_segment": {
-          "gpu_type": "V100",
-          "partition_id": 17,
-          "start_layer": 26,
-          "end_layer": 30
-        },
-        "to_segment": {
-          "gpu_type": "A100",
-          "partition_id": 0,
-          "start_layer": 31,
-          "end_layer": 35
-        },
-        "throughput": 19660800.0
-      },
-      {
-        "from_segment": {
-          "gpu_type": "A100",
-          "partition_id": 0,
-          "start_layer": 31,
-          "end_layer": 35
-        },
-        "to_segment": {
-          "gpu_type": "V100",
-          "partition_id": 15,
-          "start_layer": 36,
-          "end_layer": 40
-        },
-        "throughput": 19660800.0
-      }
-    ],
+    "network_connections": [],
     "solve_status": 2,
-    "num_pipeline_stages": 8
+    "num_pipeline_stages": 1
   }
 }
