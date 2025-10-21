@@ -1,5 +1,7 @@
-gpu_type,count,memory_gb
-A100,8,80
-V100,6,32
-H100,4,80
-RTX4090,10,24
+gpu_type,count,memory_gb,dollar_per_hour
+A100,8,80,3.00
+V100,8,32,1.00
+H100,4,80,4.20
+T4,20,16,0.40
+L20,20,48,0.90
+A10,20,24,1.00

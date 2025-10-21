@@ -1,6 +1,7 @@
 parameter,value
 sequence_length,4096
-batch_size,32
+min_batch_size,16
+max_batch_size,64
 model_name,llama-70b
 num_decoder_layers,40
 d_model,8192
