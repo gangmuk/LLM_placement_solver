@@ -1,5 +1,11 @@
 # LLM_placement_solver
 
+NOTE: You need gurobi license to run the solver.
+
+Prerequisite:
+```bash
+pip install -r requirements.txt
+```
 
 ## how to run the solver:
 
