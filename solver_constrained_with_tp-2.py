@@ -137,45 +137,253 @@ class ThroughputFunctions:
             return 0.50     # Very poor (batch=1)
     
     @staticmethod
-    def gpu_throughput(gpu_type: str, seq_len: int, batch_size: int, num_layers: int, d_model: int, bytes_per_element: int) -> float:
+    def calculate_arithmetic_intensity(num_layers: int, batch_size: int, seq_len: int, 
+                                      d_model: int, d_hidden: int, bytes_per_element: int,
+                                      tp_degree: int = 1) -> float:
+        """
+        Calculate arithmetic intensity (FLOPs / Byte) using roofline model.
+        Higher AI = more compute-bound, lower AI = more memory-bound.
+        
+        Args:
+            num_layers: Number of transformer layers in segment
+            batch_size: Batch size
+            seq_len: Sequence length
+            d_model: Model hidden dimension
+            d_hidden: FFN intermediate dimension
+            bytes_per_element: Bytes per element (2 for FP16, 4 for FP32)
+            tp_degree: Tensor parallelism degree
+        
+        Returns:
+            Arithmetic intensity in FLOPs per byte
+        """
+        # === FLOPs Calculation (per layer, per token) ===
+        # Attention: Q, K, V, O projections (4 × 2D²) + attention scores (4D×seq)
+        flops_attn_proj = 4 * 2 * d_model * d_model  # 4 projections
+        flops_attn_scores = 4 * seq_len * d_model  # QK^T + softmax*V
+        flops_attention = flops_attn_proj + flops_attn_scores
+        
+        # FFN: typically 3 projections (up, down, gate) for SwiGLU
+        # up: D→d_hidden, gate: D→d_hidden, down: d_hidden→D
+        flops_ffn = (2 * d_model * d_hidden +  # up projection
+                     2 * d_model * d_hidden +  # gate projection  
+                     2 * d_hidden * d_model)   # down projection
+        
+        # Total FLOPs for the segment
+        flops_per_token = (flops_attention + flops_ffn) * num_layers
+        total_flops = flops_per_token * batch_size
+        
+        # === Memory Access Calculation (per layer, per token) ===
+        # Weights (divided by TP): (4D² for attention + 3D×d_hidden for FFN) per layer
+        bytes_weights_per_layer = (
+            4 * d_model * d_model +  # Attention projections (Q, K, V, O)
+            3 * d_model * d_hidden   # FFN projections (up, gate, down)
+        ) * bytes_per_element / tp_degree
+        
+        # KV cache per layer: 2 (K+V) × seq_len × D (sharded by TP)
+        bytes_kv_cache_per_layer = 2 * seq_len * d_model * bytes_per_element / tp_degree
+        
+        # Activations per layer: hidden dimension
+        bytes_activations_per_layer = d_model * bytes_per_element
+        
+        # Total memory access per token
+        bytes_per_token = (bytes_weights_per_layer + bytes_kv_cache_per_layer + 
+                          bytes_activations_per_layer) * num_layers
+        total_bytes = bytes_per_token * batch_size
+        
+        # Arithmetic Intensity = FLOPs / Bytes
+        if total_bytes == 0:
+            return float('inf')  # Edge case: no memory access
+        
+        return total_flops / total_bytes
+    
+    @staticmethod
+    def get_ridge_point(gpu_type: str) -> float:
+        """
+        Calculate the ridge point for roofline model.
+        Ridge point = Peak FLOPS / Peak Bandwidth (FLOPs per byte)
+        
+        Above ridge point: compute-bound
+        Below ridge point: memory-bound
+        
+        Args:
+            gpu_type: GPU type name
+        
+        Returns:
+            Ridge point in FLOPs per byte
+        """
         specs = ThroughputFunctions.GPU_SPECS.get(gpu_type, ThroughputFunctions.GPU_SPECS['A100'])
         
-        # Correct FLOP count per layer
-        # Attention: QKV + attention + output projections
+        # Convert to consistent units
+        peak_flops = specs['tflops'] * 1e12  # TFLOPS → FLOPS
+        peak_bandwidth = specs['mem_bw'] * 1e9  # GB/s → bytes/s
+        
+        ridge_point = peak_flops / peak_bandwidth
+        
+        return ridge_point
+    
+    @staticmethod
+    def determine_regime(arithmetic_intensity: float, ridge_point: float) -> str:
+        """
+        Determine if workload is compute-bound or memory-bound.
+        
+        Args:
+            arithmetic_intensity: FLOPs per byte
+            ridge_point: Ridge point (FLOPs per byte) for the GPU
+        
+        Returns:
+            "COMPUTE_BOUND" or "MEMORY_BOUND"
+        """
+        return "COMPUTE_BOUND" if arithmetic_intensity > ridge_point else "MEMORY_BOUND"
+    
+    @staticmethod
+    def gpu_throughput(gpu_type: str, seq_len: int, batch_size: int, num_layers: int, 
+                      d_model: int, bytes_per_element: int, d_hidden: int = None) -> float:
+        """
+        Calculate GPU throughput using roofline model.
+        Automatically determines if workload is compute-bound or memory-bound.
+        
+        Args:
+            gpu_type: GPU type name
+            seq_len: Sequence length
+            batch_size: Batch size
+            num_layers: Number of layers in segment
+            d_model: Model hidden dimension
+            bytes_per_element: Bytes per element (2 for FP16)
+            d_hidden: FFN intermediate dimension (defaults to 4*d_model if not provided)
+        
+        Returns:
+            Throughput in tokens/second
+        """
+        # Default FFN dimension if not provided
+        if d_hidden is None:
+            d_hidden = 4 * d_model
+        
+        specs = ThroughputFunctions.GPU_SPECS.get(gpu_type, ThroughputFunctions.GPU_SPECS['A100'])
+        
+        # === Roofline Model Analysis ===
+        # Calculate arithmetic intensity (FLOPs per byte)
+        arithmetic_intensity = ThroughputFunctions.calculate_arithmetic_intensity(
+            num_layers, batch_size, seq_len, d_model, d_hidden, bytes_per_element, tp_degree=1
+        )
+        
+        # Get ridge point for this GPU
+        ridge_point = ThroughputFunctions.get_ridge_point(gpu_type)
+        
+        # Determine regime
+        regime = ThroughputFunctions.determine_regime(arithmetic_intensity, ridge_point)
+        
+        # === Compute FLOPs (same for both regimes) ===
+        # Attention: Q, K, V, O projections + attention scores
         attn_proj_flops = 2 * 4 * batch_size * seq_len * d_model * d_model  # QKV + output
         attn_score_flops = 4 * batch_size * seq_len * seq_len * d_model  # QK^T + softmax*V
         
-        # MLP: up + down projections
-        d_ff = 4 * d_model
-        mlp_flops = 16 * batch_size * seq_len * d_model * d_model
+        # FFN: 3 projections (up, gate, down)
+        ffn_flops = 2 * batch_size * seq_len * (
+            d_model * d_hidden +  # up
+            d_model * d_hidden +  # gate
+            d_hidden * d_model    # down
+        )
         
-        flops_per_layer = attn_proj_flops + attn_score_flops + mlp_flops
+        flops_per_layer = attn_proj_flops + attn_score_flops + ffn_flops
         total_flops = num_layers * flops_per_layer
         
-        time_compute = total_flops / (specs['tflops'] * 1e12 * specs['efficiency'])
+        # === Compute Memory Access (same for both regimes) ===
+        # Weights per layer: 4D² (attention) + 3D×d_hidden (FFN)
+        weight_bytes = num_layers * (4 * d_model * d_model + 3 * d_model * d_hidden) * bytes_per_element
         
-        # Weights per layer: QKV (3D²) + Output (D²) + MLP_up (4D²) + MLP_down (4D²) = 12D²
-        weight_bytes = num_layers * 12 * d_model * d_model * bytes_per_element
+        # Activations + KV cache
         activation_bytes = batch_size * seq_len * d_model * bytes_per_element
-        time_memory = (weight_bytes + activation_bytes) / (specs['mem_bw'] * 1e9)
+        kv_cache_bytes = num_layers * 2 * batch_size * seq_len * d_model * bytes_per_element
         
-        time_per_batch = max(time_compute, time_memory)
+        total_bytes = weight_bytes + activation_bytes + kv_cache_bytes
+        
+        # === Calculate Throughput Based on Regime ===
+        if regime == "COMPUTE_BOUND":
+            # Limited by compute - use FLOPS
+            time_per_batch = total_flops / (specs['tflops'] * 1e12 * specs['efficiency'])
+        else:  # MEMORY_BOUND
+            # Limited by memory bandwidth
+            time_per_batch = total_bytes / (specs['mem_bw'] * 1e9 * specs['efficiency'])
+        
         tokens_per_batch = batch_size * seq_len
-        
         base_throughput = tokens_per_batch / time_per_batch
+        
         # Apply batch efficiency factor - larger batches utilize GPU better
-        return base_throughput * ThroughputFunctions.batch_efficiency_factor(batch_size)
+        final_throughput = base_throughput * ThroughputFunctions.batch_efficiency_factor(batch_size)
+        
+        return final_throughput
     
     @staticmethod
     def gpu_throughput_with_tp(gpu_type: str, seq_len: int, batch_size: int, 
-                               num_layers: int, d_model: int, bytes_per_element: int, tp_degree: int) -> float:
-        """GPU throughput with tensor parallelism"""
-        base_throughput = ThroughputFunctions.gpu_throughput(
-            gpu_type, seq_len, batch_size, num_layers, d_model, bytes_per_element
+                               num_layers: int, d_model: int, bytes_per_element: int, 
+                               tp_degree: int, d_hidden: int = None) -> float:
+        """
+        GPU throughput with tensor parallelism using roofline model.
+        TP affects both memory access (weight sharding) and introduces communication overhead.
+        
+        Args:
+            gpu_type: GPU type name
+            seq_len: Sequence length
+            batch_size: Batch size
+            num_layers: Number of layers in segment
+            d_model: Model hidden dimension
+            bytes_per_element: Bytes per element (2 for FP16)
+            tp_degree: Tensor parallelism degree
+            d_hidden: FFN intermediate dimension (defaults to 4*d_model)
+        
+        Returns:
+            Throughput in tokens/second with TP
+        """
+        # Default FFN dimension if not provided
+        if d_hidden is None:
+            d_hidden = 4 * d_model
+        
+        specs = ThroughputFunctions.GPU_SPECS.get(gpu_type, ThroughputFunctions.GPU_SPECS['A100'])
+        
+        # === Roofline Model Analysis with TP ===
+        # TP reduces memory access (weights are sharded) but FLOPs remain the same per GPU
+        arithmetic_intensity = ThroughputFunctions.calculate_arithmetic_intensity(
+            num_layers, batch_size, seq_len, d_model, d_hidden, bytes_per_element, tp_degree
         )
         
-        efficiency = ThroughputFunctions.TP_EFFICIENCY.get(tp_degree, 0.70)
-        tp_speedup = tp_degree * efficiency
+        ridge_point = ThroughputFunctions.get_ridge_point(gpu_type)
+        regime = ThroughputFunctions.determine_regime(arithmetic_intensity, ridge_point)
+        
+        # === Compute FLOPs (per GPU - same across TP) ===
+        attn_proj_flops = 2 * 4 * batch_size * seq_len * d_model * d_model  # QKV + output
+        attn_score_flops = 4 * batch_size * seq_len * seq_len * d_model
+        ffn_flops = 2 * batch_size * seq_len * (
+            d_model * d_hidden + d_model * d_hidden + d_hidden * d_model
+        )
+        
+        flops_per_layer = attn_proj_flops + attn_score_flops + ffn_flops
+        total_flops = num_layers * flops_per_layer
+        
+        # === Compute Memory Access with TP (weights sharded by TP) ===
+        # Weights are sharded across TP GPUs
+        weight_bytes = num_layers * (4 * d_model * d_model + 3 * d_model * d_hidden) * bytes_per_element / tp_degree
+        
+        # KV cache is also sharded along hidden dimension
+        activation_bytes = batch_size * seq_len * d_model * bytes_per_element
+        kv_cache_bytes = num_layers * 2 * batch_size * seq_len * d_model * bytes_per_element / tp_degree
+        
+        total_bytes = weight_bytes + activation_bytes + kv_cache_bytes
+        
+        # === Calculate Throughput Based on Regime ===
+        if regime == "COMPUTE_BOUND":
+            time_per_batch = total_flops / (specs['tflops'] * 1e12 * specs['efficiency'])
+        else:  # MEMORY_BOUND
+            time_per_batch = total_bytes / (specs['mem_bw'] * 1e9 * specs['efficiency'])
+        
+        tokens_per_batch = batch_size * seq_len
+        base_throughput = tokens_per_batch / time_per_batch
+        
+        # Apply batch efficiency
+        base_throughput *= ThroughputFunctions.batch_efficiency_factor(batch_size)
+        
+        # Apply TP efficiency (accounts for allreduce communication overhead)
+        tp_efficiency = ThroughputFunctions.TP_EFFICIENCY.get(tp_degree, 0.70)
+        tp_speedup = tp_degree * tp_efficiency
         
         return base_throughput * tp_speedup
 
@@ -186,7 +394,8 @@ class LLMPlacementSolverWithTP:
                  enable_symmetry_breaking: bool = True,
                  enable_upper_bound: bool = True, enable_tight_bigm: bool = True,
                  enable_flow_conservation: bool = True, threads: Optional[int] = None,
-                 max_threads: int = 32, generate_network: Optional[Tuple[float, float]] = None):
+                 max_threads: int = 32, generate_network: Optional[Tuple[float, float]] = None,
+                 cloud_provider: Optional[str] = None):
         self.options = {
             "WLSACCESSID": "790b9c11-45d0-4785-8d99-a5e6414f9321",
             "WLSSECRET": "adef4738-7bf6-41b8-8dfd-d04e23d53e51",
@@ -194,6 +403,7 @@ class LLMPlacementSolverWithTP:
         }
         self.env = gp.Env(params=self.options)
         self.config_dir = config_dir
+        self.cloud_provider = cloud_provider
         
         # Optimization flags
         self.enable_symmetry_breaking = enable_symmetry_breaking
@@ -203,6 +413,13 @@ class LLMPlacementSolverWithTP:
         self.threads = threads
         self.max_threads = max_threads
 
+        # Load cloud pricing data if available
+        cloud_specs_file = 'cloud_instances_specs.csv'
+        if os.path.exists(cloud_specs_file):
+            self.cloud_pricing = self._load_cloud_pricing(cloud_specs_file)
+        else:
+            self.cloud_pricing = None
+            
         # Load configuration
         gpu_pool_file = os.path.join(config_dir, 'gpu_pool.csv')
         network_file = os.path.join(config_dir, 'network_bandwidth.csv')
@@ -260,6 +477,81 @@ class LLMPlacementSolverWithTP:
         logger.info(f"  - Model: {self.config.num_decoder_layers} layers")
         logger.info(f"  - Problem size: {len(self.valid_segments)} segments, {len(self.valid_connections)} connections")
     
+    def _load_cloud_pricing(self, filename: str) -> Dict[Tuple[str, str], float]:
+        """
+        Load cloud GPU pricing from cloud_instances_specs.csv
+        Returns dict: (provider, gpu_model) -> price_per_gpu_per_hour
+        """
+        import re
+        
+        df = pd.read_csv(filename)
+        pricing = {}
+        
+        for _, row in df.iterrows():
+            provider = row['Cloud Provider']
+            gpu_model = row['GPU Model']
+            price_str = row['Price per Hour USD']
+            
+            # Skip if no price available
+            if pd.isna(price_str) or 'Contact' in str(price_str):
+                continue
+            
+            # Parse price (handle ranges like "$140-160 (estimated)")
+            numbers = re.findall(r'[\d.]+', str(price_str))
+            if not numbers:
+                continue
+            
+            # If range, take average
+            if len(numbers) >= 2:
+                price_value = (float(numbers[0]) + float(numbers[1])) / 2
+            else:
+                price_value = float(numbers[0])
+            
+            # Check if price is already "per GPU" or total instance price
+            if 'per GPU' in str(price_str):
+                # Price is already per GPU, use as-is
+                price_per_gpu = price_value
+            else:
+                # Price is for entire instance, divide by GPU count
+                gpu_count_str = str(row['GPU Count'])
+                gpu_count_numbers = re.findall(r'\d+', gpu_count_str)
+                if not gpu_count_numbers:
+                    continue
+                gpu_count = int(gpu_count_numbers[0])
+                price_per_gpu = price_value / gpu_count
+            
+            pricing[(provider, gpu_model)] = price_per_gpu
+        
+        return pricing
+    
+    def _get_cloud_price(self, gpu_type: str) -> Optional[float]:
+        """
+        Get cloud price for a GPU type from the specified provider.
+        Returns the cheapest price if provider not specified.
+        """
+        if not self.cloud_pricing:
+            return None
+        
+        # Find matching prices
+        matching_prices = []
+        for (provider, gpu_model), price in self.cloud_pricing.items():
+            if gpu_type in gpu_model:  # e.g., "V100" in "NVIDIA V100"
+                if self.cloud_provider is None or provider == self.cloud_provider:
+                    matching_prices.append((provider, price))
+        
+        if not matching_prices:
+            return None
+        
+        if self.cloud_provider:
+            # Return price from specified provider
+            for provider, price in matching_prices:
+                if provider == self.cloud_provider:
+                    return price
+            return None
+        else:
+            # Return cheapest price
+            return min(price for _, price in matching_prices)
+    
     def _load_gpu_pool(self, filename: str) -> Dict[str, GPUType]:
         """Load GPU pool configuration"""
         df = pd.read_csv(filename)
@@ -268,13 +560,31 @@ class LLMPlacementSolverWithTP:
         
         for _, row in df.iterrows():
             global_ids = list(range(global_id, global_id + row['count']))
+            
+            # Try to get price from config first, then from cloud pricing
+            if 'dollar_per_hour' in row and pd.notna(row['dollar_per_hour']):
+                cost_per_hour = float(row['dollar_per_hour'])
+                price_source = "config"
+            else:
+                # Look up from cloud pricing
+                cloud_price = self._get_cloud_price(row['gpu_type'])
+                if cloud_price is not None:
+                    cost_per_hour = cloud_price
+                    price_source = f"cloud ({self.cloud_provider or 'cheapest'})"
+                else:
+                    cost_per_hour = 0.0
+                    price_source = "default (0.0)"
+            
             gpu_types[row['gpu_type']] = GPUType(
                 name=row['gpu_type'],
                 count=row['count'],
                 memory_gb=row['memory_gb'],
                 global_ids=global_ids,
-                cost_per_hour=float(row.get('dollar_per_hour', 0.0))  # NEW: Load cost
+                cost_per_hour=cost_per_hour
             )
+            
+            logger.info(f"  GPU {row['gpu_type']}: ${cost_per_hour:.2f}/hour (from {price_source})")
+            
             global_id += row['count']
         
         return gpu_types
@@ -586,7 +896,7 @@ class LLMPlacementSolverWithTP:
         """Generate segments with variable TP degree and batch size per segment"""
         valid_segments = []
         batch_size_options = self._get_batch_size_options()
-        print(f"Batch size options: {batch_size_options}")
+        logger.info(f"Batch size options: {batch_size_options}")
         # MAX_SEGMENTS = 10000 # NOTE: Hardcoded max segment. not ideal though... it prevents combinatorial explosion
         for gpu_type, allocations in self.tp_allocations.items():
             for gpu_set, tp_degree, partition_id in allocations:
@@ -964,7 +1274,7 @@ class LLMPlacementSolverWithTP:
                 self.cost <= self.config.max_hourly_cost,
                 name="cost_budget"
             )
-            logger.info(f"Added cost budget constraint: ≤ ${self.config.max_hourly_cost:.2f}/hour")
+            logger.info(f"Added cost budget constraint: <= ${self.config.max_hourly_cost:.2f}/hour")
         
         # 5. Network connection constraints
         for (seg1, seg2) in self.valid_connections:
@@ -982,7 +1292,7 @@ class LLMPlacementSolverWithTP:
                     throughput_expr = gp.quicksum(
                         ThroughputFunctions.gpu_throughput_with_tp(
                             gpu_type, self.config.sequence_length,
-                            seg[6], seg[5], self.config.d_model, self.config.bytes_per_element, seg[2]  # seg[6]=batch_size, seg[5]=segment_size, seg[2]=tp_degree
+                            seg[6], seg[5], self.config.d_model, self.config.bytes_per_element, seg[2], self.config.d_hidden  # seg[6]=batch_size, seg[5]=segment_size, seg[2]=tp_degree
                         ) * self.x[seg]
                         for seg in self.valid_segments 
                         if seg[0] == gpu_type and seg[3] == partition_id  # seg[3]=partition_id
@@ -1045,7 +1355,7 @@ class LLMPlacementSolverWithTP:
                 # Use max_batch_size for upper bound calculation
                 max_throughput = ThroughputFunctions.gpu_throughput_with_tp(
                     gpu_type, self.config.sequence_length,
-                    self.config.max_batch_size, max_size, self.config.d_model, self.config.bytes_per_element, tp_degree
+                    self.config.max_batch_size, max_size, self.config.d_model, self.config.bytes_per_element, tp_degree, self.config.d_hidden
                 )
                 # Only create M for partitions that exist
                 for gpu_set, tp_degree_alloc, partition_id in allocations:
@@ -1211,7 +1521,7 @@ class LLMPlacementSolverWithTP:
             # Use min_batch_size for lower bound estimation
             t_est = ThroughputFunctions.gpu_throughput(
                 gpu_type, self.config.sequence_length, self.config.min_batch_size,
-                1, self.config.d_model, self.config.bytes_per_element
+                1, self.config.d_model, self.config.bytes_per_element, self.config.d_hidden
             )
             min_tp_estimates.append(t_est)
         
@@ -1246,7 +1556,7 @@ class LLMPlacementSolverWithTP:
                     best_solution = self.solution.copy()
                 
                 if actual_cpt <= target_cpt:
-                    logger.info(f"  ✓ Meets target!")
+                    logger.info(f" Meets target")
                     break
                 else:
                     # Tighten budget
@@ -1272,8 +1582,8 @@ class LLMPlacementSolverWithTP:
         Estimate feasible budget range based on max_cost_per_token target.
         
         Logic:
-        - To meet $/token target: cost / (throughput × 3600) ≤ max_cost_per_token
-        - So: cost ≤ max_cost_per_token × throughput × 3600
+        - To meet $/token target: cost / (throughput x 3600) <= max_cost_per_token
+        - So: cost <= max_cost_per_token x throughput x 3600
         - Estimate min/max throughput from GPU memory (proxy for performance)
         - Calculate corresponding budget bounds
         
@@ -1324,7 +1634,7 @@ class LLMPlacementSolverWithTP:
             max_budget = min(max_budget, max_cost * 0.8)
             logger.info(f"  Aggressive $/token target detected, focusing on lower budgets")
         
-        logger.info(f"Competitive budget range for $/token ≤ ${target_cpt:.9f}:")
+        logger.info(f"Competitive budget range for $/token <= ${target_cpt:.9f}:")
         logger.info(f"  GPU cost range: ${min_cost:.2f} - ${max_cost:.2f}/hour")
         logger.info(f"  Search budget range: ${min_budget:.2f} - ${max_budget:.2f}/hour")
         
@@ -1365,9 +1675,9 @@ class LLMPlacementSolverWithTP:
                     
                     # Check if ballpark meets target
                     if ballpark_cpt <= self.config.max_cost_per_token:
-                        logger.info(f"✓ Ballpark meets target! (${ballpark_cpt:.9f} ≤ ${self.config.max_cost_per_token:.9f})")
+                        logger.info(f"Ballpark meets target (${ballpark_cpt:.9f} <= ${self.config.max_cost_per_token:.9f})")
                     else:
-                        logger.warning(f"✗ Ballpark exceeds target (${ballpark_cpt:.9f} > ${self.config.max_cost_per_token:.9f})")
+                        logger.warning(f"Ballpark exceeds target (${ballpark_cpt:.9f} > ${self.config.max_cost_per_token:.9f})")
                     
                     # PERFORMANCE OPTIMIZATION: Reduced from 12 to 6-8 budget points
                     # COMPETITIVE OPTIMIZATION: Focus on range that can beat competitor
@@ -1445,9 +1755,9 @@ class LLMPlacementSolverWithTP:
                 if cpt < best_cpt:
                     best_cpt = cpt
                     best_solution = self.solution.copy()
-                    logger.info(f"  ✓ New best $/token!")
+                    logger.info(f"  OK New best $/token!")
             else:
-                logger.info(f"  ✗ Infeasible")
+                logger.info(f"Infeasible")
         
         # Restore original config
         self.config.max_hourly_cost = original_budget
@@ -1467,7 +1777,7 @@ class LLMPlacementSolverWithTP:
             target = self.config.max_cost_per_token
             if best_cpt <= target:
                 improvement = (target - best_cpt) / target * 100
-                logger.info(f"\nMEETS TARGET: ${best_cpt:.9f} ≤ ${target:.9f}")
+                logger.info(f"\nMEETS TARGET: ${best_cpt:.9f} <= ${target:.9f}")
                 logger.info(f"   {improvement:.1f}% better than target!")
             else:
                 shortfall = (best_cpt - target) / target * 100
@@ -1477,7 +1787,7 @@ class LLMPlacementSolverWithTP:
             # Log Pareto frontier
             logger.info(f"\nPareto Frontier (all solutions):")
             for r in sorted(all_results, key=lambda x: x['cost_per_token']):
-                marker = "✓" if r['cost_per_token'] <= target else " "
+                marker = "*" if r['cost_per_token'] <= target else " "
                 logger.info(f"  {marker} ${r['cost_per_token']:.9f}/token: "
                            f"{r['throughput']:.0f} tokens/s, ${r['cost']:.2f}/h")
             
@@ -1635,6 +1945,9 @@ class LLMPlacementSolverWithTP:
         # Batch size analysis
         self._log_batch_size_analysis()
         
+        # Roofline model analysis
+        self._log_roofline_analysis()
+        
         # NEW: Detailed GPU utilization analysis
         self._log_solution_analysis()
     
@@ -1660,13 +1973,13 @@ class LLMPlacementSolverWithTP:
             
             # Explain the efficiency
             if optimal_batch >= 32:
-                logger.info(f"  ✓ Optimal utilization (batch ≥ 32)")
+                logger.info(f"Optimal utilization (batch >= 32)")
             elif optimal_batch >= 16:
-                logger.info(f"  ✓ Very good utilization (batch ≥ 16)")
+                logger.info(f"Very good utilization (batch >= 16)")
             elif optimal_batch >= 8:
-                logger.info(f"  → Good utilization (batch ≥ 8)")
+                logger.info(f"Good utilization (batch >= 8)")
             else:
-                logger.info(f"  ⚠ Sub-optimal utilization (batch < 8)")
+                logger.info(f"Sub-optimal utilization (batch < 8)")
         
         # If we have multiple batch size options, show comparison
         if len(batch_size_options) > 1 and optimal_batch and len(self.solution['gpu_assignments']) > 0:
@@ -1709,32 +2022,159 @@ class LLMPlacementSolverWithTP:
                 logger.info(f"  {bs:<8} {efficiency:<12.1%} {est_throughput:<18.0f} "
                            f"${est_cost_per_token:.9f}{marker}")
     
+    def _log_roofline_analysis(self):
+        """Analyze and log roofline model insights for the solution"""
+        logger.info("\n" + "="*80)
+        logger.info("ROOFLINE MODEL ANALYSIS")
+        logger.info("="*80)
+        
+        optimal_batch = self.solution.get('batch_size', self.config.min_batch_size)
+        
+        logger.info(f"\nPerformance Bottleneck Analysis (Roofline Model):")
+        logger.info(f"  Determines if each segment is compute-bound or memory-bound")
+        logger.info("-" * 80)
+        logger.info(f"  {'GPU Type':<10} {'TP':<4} {'Layers':<7} {'AI':<12} {'Ridge':<12} {'Regime':<15} {'Bottleneck'}")
+        logger.info("-" * 80)
+        
+        # Analyze each segment in the solution
+        for assignment in self.solution['gpu_assignments']:
+            gpu_type = assignment['gpu_type']
+            tp_degree = assignment['tp_degree']
+            segment_size = assignment['segment_size']
+            
+            # Calculate arithmetic intensity for this segment
+            ai = ThroughputFunctions.calculate_arithmetic_intensity(
+                segment_size, optimal_batch, self.config.sequence_length,
+                self.config.d_model, self.config.d_hidden, self.config.bytes_per_element, tp_degree
+            )
+            
+            # Get ridge point
+            ridge_point = ThroughputFunctions.get_ridge_point(gpu_type)
+            
+            # Determine regime
+            regime = ThroughputFunctions.determine_regime(ai, ridge_point)
+            
+            # Format output
+            ai_str = f"{ai:.2f}"
+            ridge_str = f"{ridge_point:.2f}"
+            
+            if regime == "COMPUTE_BOUND":
+                bottleneck = "GPU Compute"
+                regime_str = "Compute-bound"
+            else:
+                bottleneck = "Memory Bandwidth"
+                regime_str = "Memory-bound"
+            
+            logger.info(f"  {gpu_type:<10} {tp_degree:<4} {segment_size:<7} {ai_str:<12} {ridge_str:<12} {regime_str:<15} {bottleneck}")
+        
+        # Summary insights
+        logger.info("\n" + "-" * 80)
+        logger.info("Roofline analysis:")
+        logger.info(f"- Arithmetic Intensity (AI) = FLOPs / Byte accessed")
+        logger.info(f"- Ridge Point = Peak FLOPS / Peak Memory Bandwidth")
+        logger.info(f"- Arithmetic Intensity > Ridge -> Compute-bound (limited by GPU compute)")
+        logger.info(f"- Arithmetic Intensity < Ridge -> Memory-bound (limited by memory bandwidth)")
+        logger.info(f"- Tensor Parallelism (TP) reduces memory per GPU -> increases AI -> may shift regime")
+        
+        # Count regimes
+        compute_bound_count = 0
+        memory_bound_count = 0
+        
+        for assignment in self.solution['gpu_assignments']:
+            gpu_type = assignment['gpu_type']
+            tp_degree = assignment['tp_degree']
+            segment_size = assignment['segment_size']
+            
+            ai = ThroughputFunctions.calculate_arithmetic_intensity(
+                segment_size, optimal_batch, self.config.sequence_length,
+                self.config.d_model, self.config.d_hidden, self.config.bytes_per_element, tp_degree
+            )
+            ridge_point = ThroughputFunctions.get_ridge_point(gpu_type)
+            regime = ThroughputFunctions.determine_regime(ai, ridge_point)
+            
+            if regime == "COMPUTE_BOUND":
+                compute_bound_count += 1
+            else:
+                memory_bound_count += 1
+        
+        total_segments = len(self.solution['gpu_assignments'])
+        logger.info(f"Regime Distribution:")
+        logger.info(f"- Compute-bound segments: {compute_bound_count}/{total_segments} ({100*compute_bound_count/total_segments:.0f}%)")
+        logger.info(f"- Memory-bound segments:  {memory_bound_count}/{total_segments} ({100*memory_bound_count/total_segments:.0f}%)")
+        
+        if memory_bound_count > compute_bound_count:
+            logger.info(f"\nMost segments are memory-bound.")
+            logger.info(f"- Consider GPUs with higher memory bandwidth for better performance.")
+            logger.info(f"- Increasing TP degree can help (reduces memory per GPU).")
+        elif compute_bound_count > memory_bound_count:
+            logger.info(f"Most segments are compute-bound.")
+            logger.info(f"- Consider GPUs with higher TFLOPS for better performance.")
+            logger.info(f"- Memory bandwidth is not the bottleneck here.")
+    
     def _log_solution_analysis(self):
         """Comprehensive analysis of why the solution looks the way it does"""
         logger.info("\n" + "="*80)
         logger.info("SOLUTION ANALYSIS - GPU EFFICIENCY & SELECTION")
         logger.info("="*80)
         
-        # 1. Compute GPU efficiency ratios (FLOP per $)
+        # Determine if workload is primarily memory-bound or compute-bound
+        optimal_batch = self.solution.get('batch_size', self.config.min_batch_size)
+        memory_bound_count = 0
+        compute_bound_count = 0
+        
+        for assignment in self.solution['gpu_assignments']:
+            gpu_type = assignment['gpu_type']
+            tp_degree = assignment['tp_degree']
+            segment_size = assignment['segment_size']
+            
+            ai = ThroughputFunctions.calculate_arithmetic_intensity(
+                segment_size, optimal_batch, self.config.sequence_length,
+                self.config.d_model, self.config.d_hidden, self.config.bytes_per_element, tp_degree
+            )
+            ridge_point = ThroughputFunctions.get_ridge_point(gpu_type)
+            regime = ThroughputFunctions.determine_regime(ai, ridge_point)
+            
+            if regime == "COMPUTE_BOUND":
+                compute_bound_count += 1
+            else:
+                memory_bound_count += 1
+        
+        is_memory_bound = memory_bound_count > compute_bound_count
+        
+        # 1. Compute GPU efficiency ratios (both FLOP/$ and Bandwidth/$)
         gpu_efficiency = {}
         for gpu_type, gpu_obj in self.gpu_types.items():
             specs = ThroughputFunctions.GPU_SPECS.get(gpu_type)
             if specs:
                 effective_flops = specs['tflops'] * specs['efficiency']
-                efficiency_ratio = effective_flops / gpu_obj.cost_per_hour
+                effective_bw = specs['mem_bw'] * specs['efficiency']
+                compute_efficiency = effective_flops / gpu_obj.cost_per_hour
+                memory_efficiency = effective_bw / gpu_obj.cost_per_hour
                 gpu_efficiency[gpu_type] = {
                     'flops': effective_flops,
+                    'bandwidth': effective_bw,
                     'cost': gpu_obj.cost_per_hour,
-                    'ratio': efficiency_ratio
+                    'compute_ratio': compute_efficiency,
+                    'memory_ratio': memory_efficiency
                 }
         
-        # Sort by efficiency
-        sorted_efficiency = sorted(gpu_efficiency.items(), key=lambda x: x[1]['ratio'], reverse=True)
+        # Sort by the relevant metric
+        if is_memory_bound:
+            sorted_efficiency = sorted(gpu_efficiency.items(), key=lambda x: x[1]['memory_ratio'], reverse=True)
+            metric_name = "Memory Bandwidth/$ ratio"
+            logger.info(f"\nWARNING WORKLOAD IS MEMORY-BOUND -> Memory Bandwidth/$ is the key metric!")
+        else:
+            sorted_efficiency = sorted(gpu_efficiency.items(), key=lambda x: x[1]['compute_ratio'], reverse=True)
+            metric_name = "Compute (TFLOP/$) ratio"
+            logger.info(f"\nOK WORKLOAD IS COMPUTE-BOUND -> TFLOP/$ is the key metric!")
         
-        logger.info("\nGPU Efficiency Ranking (TFLOP/$ ratio):")
+        logger.info(f"\nGPU Efficiency Ranking ({metric_name}):")
         logger.info("-" * 80)
         for i, (gpu_type, data) in enumerate(sorted_efficiency, 1):
-            logger.info(f"  {i}. {gpu_type:<10} {data['flops']:>6.1f} TFLOP × eff @ ${data['cost']:.2f}/h = {data['ratio']:>6.1f} TFLOP/$")
+            if is_memory_bound:
+                logger.info(f"  {i}. {gpu_type:<10} {data['bandwidth']:>7.1f} GB/s × eff @ ${data['cost']:.2f}/h = {data['memory_ratio']:>6.1f} GB/s per $")
+            else:
+                logger.info(f"  {i}. {gpu_type:<10} {data['flops']:>6.1f} TFLOP × eff @ ${data['cost']:.2f}/h = {data['compute_ratio']:>6.1f} TFLOP/$")
         
         # 2. Analyze which GPUs were actually used
         gpu_usage = {}
@@ -1790,7 +2230,7 @@ class LLMPlacementSolverWithTP:
                     # Use max_batch_size for optimistic throughput estimate
                     hyp_throughput = ThroughputFunctions.gpu_throughput_with_tp(
                         gpu_type, self.config.sequence_length, self.config.max_batch_size,
-                        5, self.config.d_model, self.config.bytes_per_element, 4
+                        5, self.config.d_model, self.config.bytes_per_element, 4, self.config.d_hidden
                     )
                     hyp_cost = gpu_obj.cost_per_hour * 4  # TP=4
                     logger.info(f"             Hypothetical (5 layers, TP=4): {hyp_throughput:.0f} tokens/s, ${hyp_cost:.2f}/h")
@@ -1834,12 +2274,12 @@ class LLMPlacementSolverWithTP:
             alt_throughput = ThroughputFunctions.gpu_throughput_with_tp(
                 best_gpu_type, self.config.sequence_length, self.config.max_batch_size,
                 self.config.num_decoder_layers, self.config.d_model, 
-                self.config.bytes_per_element, max_tp
+                self.config.bytes_per_element, max_tp, self.config.d_hidden
             )
             alt_cost = best_gpu.cost_per_hour * max_tp
             alt_cost_per_token = alt_cost / (alt_throughput * 3600)
             
-            logger.info(f"\n✓ CAN FIT! Single segment with TP={max_tp}:")
+            logger.info(f"\nCAN FIT Single segment with TP={max_tp}:")
             logger.info(f"  Throughput: {alt_throughput:.0f} tokens/sec")
             logger.info(f"  Cost: ${alt_cost:.2f}/hour")
             logger.info(f"  $/token: ${alt_cost_per_token:.9f}")
@@ -1856,9 +2296,9 @@ class LLMPlacementSolverWithTP:
                 logger.warning(f"  The solver found a suboptimal solution!")
             else:
                 diff_pct = (alt_cost_per_token/actual_cpt - 1)*100
-                logger.info(f"  ✓ Current multi-segment is {diff_pct:.1f}% better")
+                logger.info(f"Current multi-segment is {diff_pct:.1f}% better")
         else:
-            logger.info(f"\n✗ CANNOT FIT: Model needs {self.config.num_decoder_layers} layers but max is {max_seg_size}")
+            logger.info(f"\nCANNOT FIT: Model needs {self.config.num_decoder_layers} layers but max is {max_seg_size}")
         
         # 6. Objective function check
         logger.info("\n" + "="*80)
@@ -1889,7 +2329,7 @@ class LLMPlacementSolverWithTP:
                     t_alt = ThroughputFunctions.gpu_throughput_with_tp(
                         best_gpu_type, self.config.sequence_length, self.config.max_batch_size,
                         self.config.num_decoder_layers, self.config.d_model,
-                        self.config.bytes_per_element, max_tp
+                        self.config.bytes_per_element, max_tp, self.config.d_hidden
                     )
                     c_alt = best_gpu.cost_per_hour * max_tp
                     obj_alt = (t_alt / self.config.throughput_normalization) - \
@@ -1900,7 +2340,7 @@ class LLMPlacementSolverWithTP:
                     logger.info(f"  Cost: ${c_alt:.2f}/h")
                     
                     if obj_alt > obj_curr:
-                        logger.warning(f"  ⚠️  Alternative objective is HIGHER by {obj_alt - obj_curr:.6f}!")
+                        logger.warning(f"  WARNING Alternative objective is HIGHER by {obj_alt - obj_curr:.6f}!")
                         logger.warning(f"  This suggests the solver may have missed this solution!")
     
     def print_solution(self):
@@ -1909,23 +2349,22 @@ class LLMPlacementSolverWithTP:
             logger.error("No solution available")
             return
         
-        print("\n" + "="*100)
-        print(f"LLM PLACEMENT OPTIMIZATION RESULTS (COST-AWARE)")
-        print("="*100)
-        print(f"Model: {self.config.model_name} ({self.config.num_decoder_layers} layers)")
-        print(f"Batch Size: {self.solution['batch_size']} (optimal), Sequence Length: {self.config.sequence_length}")
-        print(f"  Available batch sizes: [{self.config.min_batch_size}...{self.config.max_batch_size}]")
-        print(f"TP Configuration: {self.solution['tp_configuration']}")
-        print(f"Pipeline Stages: {self.solution['num_pipeline_stages']} (max: {self.config.max_pipeline_stages})")
+        logger.info("\n" + "="*100)
+        logger.info(f"LLM PLACEMENT OPTIMIZATION RESULTS (COST-AWARE)")
+        logger.info("="*100)
+        logger.info(f"Model: {self.config.model_name} ({self.config.num_decoder_layers} layers)")
+        logger.info(f"Batch Size: {self.solution['batch_size']} (optimal), Sequence Length: {self.config.sequence_length}")
+        logger.info(f"  Available batch sizes: [{self.config.min_batch_size}...{self.config.max_batch_size}]")
+        logger.info(f"TP Configuration: {self.solution['tp_configuration']}")
+        logger.info(f"Pipeline Stages: {self.solution['num_pipeline_stages']} (max: {self.config.max_pipeline_stages})")
         print()
-        
         # NEW: Performance & Cost Metrics
-        print("PERFORMANCE & COST METRICS:")
-        print("-" * 100)
-        print(f"  Throughput:        {self.solution['throughput_tokens_per_sec']:.2f} tokens/sec")
-        print(f"  Cost:              ${self.solution['cost_per_hour']:.2f}/hour")
-        print(f"  $/token:           ${self.solution['cost_per_token']:.9f}")  # Changed to 9 decimals
-        print(f"  Objective Value:   {self.solution['objective_value']:.4f}")
+        logger.info("PERFORMANCE & COST METRICS:")
+        logger.info("-" * 100)
+        logger.info(f"  Throughput:        {self.solution['throughput_tokens_per_sec']:.2f} tokens/sec")
+        logger.info(f"  Cost:              ${self.solution['cost_per_hour']:.2f}/hour")
+        logger.info(f"  $/token:           ${self.solution['cost_per_token']:.9f}")  # Changed to 9 decimals
+        logger.info(f"  Objective Value:   {self.solution['objective_value']:.4f}")
         print()
         
         # NEW: Cost Comparison (if threshold specified)
@@ -1934,22 +2373,22 @@ class LLMPlacementSolverWithTP:
             our_cost = self.solution['cost_per_token']
             improvement = (competitor - our_cost) / competitor * 100
             
-            print("COST COMPARISON vs COMPETITOR:")
-            print("-" * 100)
-            print(f"  Competitor $/token:  ${competitor:.9f}")
-            print(f"  Our $/token:         ${our_cost:.9f}")
+            logger.info("COST COMPARISON vs COMPETITOR:")
+            logger.info("-" * 100)
+            logger.info(f"  Competitor $/token:  ${competitor:.9f}")
+            logger.info(f"  Our $/token:         ${our_cost:.9f}")
             if improvement > 0:
-                print(f"  Improvement:         ✓ {improvement:.1f}% BETTER")
+                logger.info(f"  Improvement:         OK {improvement:.1f}% BETTER")
             else:
-                print(f"  Improvement:         ✗ {abs(improvement):.1f}% WORSE")
+                logger.info(f"  Improvement:         Nah {abs(improvement):.1f}% WORSE")
             print()
         
         print()
         
-        print("GPU ASSIGNMENTS (WITH TP):")
-        print("-" * 100)
-        print(f"{'GPU Type':<12} {'TP':<4} {'GPU IDs':<20} {'Layers':<15} {'Size':<6} {'Throughput':<12} {'Cost/h':<10}")
-        print("-" * 100)
+        logger.info("GPU ASSIGNMENTS (WITH TP):")
+        logger.info("-" * 100)
+        logger.info(f"{'GPU Type':<12} {'TP':<4} {'GPU IDs':<20} {'Layers':<15} {'Size':<6} {'Throughput':<12} {'Cost/h':<10}")
+        logger.info("-" * 100)
         
         for assignment in self.solution['gpu_assignments']:
             layers_str = f"{assignment['start_layer']}-{assignment['end_layer']}"
@@ -1960,24 +2399,24 @@ class LLMPlacementSolverWithTP:
             tp_degree = assignment['tp_degree']
             segment_cost = self.gpu_types[gpu_type].cost_per_hour * tp_degree
             
-            print(f"{gpu_type:<12} {tp_degree:<4} "
+            logger.info(f"{gpu_type:<12} {tp_degree:<4} "
                   f"{gpu_ids_str:<20} {layers_str:<15} "
                   f"{assignment['segment_size']:<6} {assignment['throughput']:<12.2f} "
                   f"${segment_cost:<9.2f}")
         
         if self.solution['network_connections']:
-            print("\nNETWORK CONNECTIONS:")
-            print("-" * 80)
+            logger.info("\nNETWORK CONNECTIONS:")
+            logger.info("-" * 80)
             for i, conn in enumerate(self.solution['network_connections']):
                 from_seg = conn['from_segment']
                 to_seg = conn['to_segment']
-                print(f"Connection {i+1}: {from_seg['gpu_type']} partition {from_seg['partition_id']} "
+                logger.info(f"Connection {i+1}: {from_seg['gpu_type']} partition {from_seg['partition_id']} "
                       f"(layers {from_seg['start_layer']}-{from_seg['end_layer']}) -> "
                       f"{to_seg['gpu_type']} partition {to_seg['partition_id']} "
                       f"(layers {to_seg['start_layer']}-{to_seg['end_layer']}) "
                       f"[Throughput: {conn['throughput']:.2f}]")
         
-        print("\n" + "="*100)
+        logger.info("\n" + "="*100)
     
     def save_solution(self, output_file: str):
         """Save solution to JSON file"""
@@ -2161,7 +2600,7 @@ def solve_all_tp_configurations(config_dir: str, **kwargs) -> Tuple[Dict, Dict]:
                     best_throughput = solver.solution['objective_value']
                     best_solution = solver.solution
                     best_tp_config = tp_config
-                    logger.info(f"✓ New best throughput: {best_throughput:.2f} tokens/sec")
+                    logger.info(f"New best throughput: {best_throughput:.2f} tokens/sec")
         
         except Exception as e:
             logger.error(f"Failed to solve TP config {tp_config}: {e}")
@@ -2215,6 +2654,13 @@ def main():
                        help='Generate network bandwidth matrix instead of reading from CSV. '
                             'Args: intra_bandwidth (GB/s within same GPU type) inter_bandwidth (GB/s between different GPU types)')
     
+    # Cloud pricing arguments
+    parser.add_argument('--cloud-provider', type=str, 
+                        default='AWS',
+                       choices=['AWS', 'GCP', 'Azure', 'Lambda', 'CoreWeave', 'Nebius'],
+                       help='Cloud provider for pricing (uses cheapest if not specified). '
+                            'Prices loaded from cloud_instances_specs.csv')
+    
     args = parser.parse_args()
     
     if args.verbose:
@@ -2236,7 +2682,8 @@ def main():
             'enable_flow_conservation': args.enable_flow_conservation,
             'threads': args.threads,
             'max_threads': args.max_threads,
-            'generate_network': generate_network
+            'generate_network': generate_network,
+            'cloud_provider': args.cloud_provider
         }
         
         if args.search_all_tp:
@@ -2247,13 +2694,13 @@ def main():
             
             if best_solution:
                 # Print summary
-                print("\n" + "="*100)
-                print("BEST SOLUTION SUMMARY")
-                print("="*100)
-                print(f"Best TP Configuration: {best_tp_config}")
-                print(f"Throughput: {best_solution['objective_value']:.2f} tokens/sec")
-                print(f"Pipeline Stages: {best_solution['num_pipeline_stages']}")
-                print("="*100)
+                logger.info("\n" + "="*100)
+                logger.info("BEST SOLUTION SUMMARY")
+                logger.info("="*100)
+                logger.info(f"Best TP Configuration: {best_tp_config}")
+                logger.info(f"Throughput: {best_solution['objective_value']:.2f} tokens/sec")
+                logger.info(f"Pipeline Stages: {best_solution['num_pipeline_stages']}")
+                logger.info("="*100)
                 
                 # Save best solution
                 output_file = os.path.join(args.config_dir, 'solution_best_tp.json')
@@ -2306,7 +2753,7 @@ def main():
         logger.error(f"Solver failed: {e}")
         import traceback
         traceback.print_exc()
-        return 1
+        return 1g
     
     end_time = time.time()
     logger.info(f"Total time: {end_time - start_time:.0f} seconds")
@@ -2315,6 +2762,6 @@ def main():
 
 if __name__ == "__main__":
     start_time = time.time()
-    exit(main())
+    main()
     end_time = time.time()
-    print(f"Total solver runtime: {end_time - start_time:.0f} seconds")
+    logger.info(f"Total solver runtime: {end_time - start_time:.0f} seconds")

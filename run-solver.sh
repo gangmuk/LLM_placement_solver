@@ -12,49 +12,52 @@ function cleanup() {
     exit 1
 }
 
-config_dir_list=("config/medium" "config/large")
-# config_dir_list=("config/medium")
-cost_optimization_method_list=("weighted" "enumeration")
-network_config_list=("none" "600 400" "400 200")
-# network_config_list=("none" "600 400")
-run_on_background=true
-timestamp=$(date +%Y%m%d%H%M%S)
+# config_dir_list=("config/medium" "config/large")
+# cost_optimization_method_list=("weighted" "enumeration")
+# network_config_list=("600 400" "400 200")
+# run_on_background=true
+
+config_dir_list=("config/medium")
+# config_dir_list=("config/large")
+# cost_optimization_method_list=("weighted")
+cost_optimization_method_list=("enumeration")
+network_config_list=("400 200")
+run_on_background=false
+cloud_provider="AWS"
+
+timestamp=$(date +%Y%m%d_%H%M%S)
 solver="solver_constrained_with_tp-2.py"
 for config_dir in "${config_dir_list[@]}"; do
     for cost_optimization_method in "${cost_optimization_method_list[@]}"; do
         for network_config in "${network_config_list[@]}"; do
             intra_bw=$(echo ${network_config} | cut -d' ' -f1)
             inter_bw=$(echo ${network_config} | cut -d' ' -f2)
-            solver_log_path="${config_dir}/output-method_${cost_optimization_method}-network_${intra_bw}_${inter_bw}-${timestamp}.txt"
-            echo "** Starting solver, log path: ${solver_log_path}"
+            output_log_dir="${config_dir}/output-${timestamp}"
+            mkdir -p ${output_log_dir}
+            output_log_path="${output_log_dir}/method_${cost_optimization_method}-network_${intra_bw}_${inter_bw}.txt"
+            echo "** Starting solver, output_log_path: ${output_log_path}"
             start_time=$(date +%s)
             if [ "${network_config}" != "none" ]; then
                 if [ "${run_on_background}" = true ]; then
-                    python3 ${solver} --config-dir ${config_dir} --method ${cost_optimization_method} --generate-network ${intra_bw} ${inter_bw} &> ${solver_log_path} &
+                    python3 ${solver} --config-dir ${config_dir} --method ${cost_optimization_method} --generate-network ${intra_bw} ${inter_bw} --cloud-provider ${cloud_provider} &> ${output_log_path} &
                 else
-                    python3 ${solver} --config-dir ${config_dir} --method ${cost_optimization_method} --generate-network ${intra_bw} ${inter_bw} &> ${solver_log_path}
+                    python3 ${solver} --config-dir ${config_dir} --method ${cost_optimization_method} --generate-network ${intra_bw} ${inter_bw} --cloud-provider ${cloud_provider} &> ${output_log_path}
                 fi
             else
                 if [ "${run_on_background}" = true ]; then
-                    python3 ${solver} --config-dir ${config_dir} --method ${cost_optimization_method} &> ${solver_log_path} &
+                    python3 ${solver} --config-dir ${config_dir} --method ${cost_optimization_method} --cloud-provider ${cloud_provider} &> ${output_log_path} &
                 else
-                    python3 ${solver} --config-dir ${config_dir} --method ${cost_optimization_method} &> ${solver_log_path}
+                    python3 ${solver} --config-dir ${config_dir} --method ${cost_optimization_method} --cloud-provider ${cloud_provider} &> ${output_log_path}
                 fi
             fi
             if [ "${run_on_background}" = true ]; then
                 solver_pid=$!
                 echo "** Solver PID: ${solver_pid} for config: ${config_dir} method: ${cost_optimization_method} network: ${intra_bw} ${inter_bw}"
-                ## join the solver process
-                # wait ${solver_pid}
-                # echo "** Solver finished for config: ${config_dir} with method: ${cost_optimization_method} and network: ${intra_bw} ${inter_bw}"
-                # end_time=$(date +%s)
-                # runtime=$((end_time - start_time))
-                # echo "** Solver output: ${solver_log_path}, total runtime: ${runtime}"
             else
                 echo "** Solver finished for config: ${config_dir} with method: ${cost_optimization_method} and network: ${intra_bw} ${inter_bw}"
                 end_time=$(date +%s)
                 runtime=$((end_time - start_time))
-                echo "** Solver output: ${solver_log_path}, total runtime: ${runtime}"
+                echo "** Solver output_log_path: ${output_log_path}, total runtime: ${runtime}"
             fi
         done
     done
