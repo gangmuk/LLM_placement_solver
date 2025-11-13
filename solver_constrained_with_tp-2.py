@@ -572,8 +572,12 @@ class LLMPlacementSolverWithTP:
                     cost_per_hour = cloud_price
                     price_source = f"cloud ({self.cloud_provider or 'cheapest'})"
                 else:
+                    # Fallback to 0.0 with warning
                     cost_per_hour = 0.0
-                    price_source = "default (0.0)"
+                    price_source = "DEFAULT (0.0) - NO PRICING DATA"
+                    logger.warning(f"  WARNING: No cloud price found for {row['gpu_type']}! Using $0.00/hour")
+                    logger.warning(f"           This GPU will appear 'free' in optimization - add pricing to cloud_instances_specs.csv")
+                    assert False, "No cloud price found for GPU"
             
             gpu_types[row['gpu_type']] = GPUType(
                 name=row['gpu_type'],
@@ -1121,25 +1125,50 @@ class LLMPlacementSolverWithTP:
     
     def build_model(self):
         """Build the Gurobi optimization model"""
+        build_start = time.time()
         logger.info("Building optimization model with TP and practical constraints...")
         
+        model_init_start = time.time()
         self.model = gp.Model("llm_placement_with_tp_constrained", env=self.env)
         
-        # Solver parameters
-        self.model.setParam('Presolve', 2)
-        self.model.setParam('Cuts', 1)
-        self.model.setParam('Heuristics', 0.05)
-        self.model.setParam('MIPFocus', 1)
+        # Solver parameters optimized for parallelism
+        self.model.setParam('Presolve', 1)  # Normal presolve (was 2=aggressive, reduce to allow more B&B)
+        self.model.setParam('Cuts', 2)  # More aggressive cuts (parallelizable)
+        self.model.setParam('Heuristics', 0.20)  # Increase for more parallel heuristics (was 0.05)
+        self.model.setParam('MIPFocus', 0)  # Balanced (was 1=feasibility, 0 better for parallelism)
         self.model.setParam('NodefileStart', 0.5)
         self.model.setParam('TimeLimit', self.config.time_limit_seconds)
         self.model.setParam('MIPGap', self.config.optimality_gap)
         self.model.setParam('LogToConsole', 1)
         
-        self._create_variables()
-        self._create_constraints()
-        self._set_objective()
+        # PERFORMANCE: Enable concurrent MIP solver (runs multiple strategies in parallel)
+        # This is CRUCIAL for utilizing multiple cores effectively
+        self.model.setParam('ConcurrentMIP', 4)  # Run 4 concurrent solvers with different strategies
+        model_init_time = time.time() - model_init_start
         
-        logger.info("Model built successfully")
+        logger.info("Creating decision variables...")
+        var_start = time.time()
+        self._create_variables()
+        var_time = time.time() - var_start
+        logger.info(f"  Created {len(self.x)} segment variables, {len(self.e)} connection variables in {var_time:.2f}s")
+        
+        logger.info("Creating constraints (this is the slow part)...")
+        constraint_start = time.time()
+        self._create_constraints()
+        constraint_time = time.time() - constraint_start
+        logger.info(f"  Constraints created in {constraint_time:.2f}s")
+        
+        logger.info("Setting objective function...")
+        obj_start = time.time()
+        self._set_objective()
+        obj_time = time.time() - obj_start
+        logger.info(f"  Objective set in {obj_time:.2f}s")
+        
+        total_build_time = time.time() - build_start
+        logger.info("="*80)
+        logger.info("MODEL BUILD COMPLETE - ready to solve with Gurobi")
+        logger.info(f"  Total build time: {total_build_time:.2f}s (init={model_init_time:.2f}s, vars={var_time:.2f}s, constraints={constraint_time:.2f}s, obj={obj_time:.2f}s)")
+        logger.info("="*80)
     
     def _create_variables(self):
         """Create decision variables"""
@@ -1269,8 +1298,10 @@ class LLMPlacementSolverWithTP:
         self.model.addConstr(self.cost == cost_expr, name="total_cost_definition")
         
         # Budget constraint (if specified)
+        # IMPORTANT: Store reference for efficient updates in enumeration method
+        self.budget_constraint = None
         if self.config.max_hourly_cost < 999.0:
-            self.model.addConstr(
+            self.budget_constraint = self.model.addConstr(
                 self.cost <= self.config.max_hourly_cost,
                 name="cost_budget"
             )
@@ -1369,6 +1400,22 @@ class LLMPlacementSolverWithTP:
     
     def _add_pipeline_connectivity_constraints(self):
         """Ensure pipeline connectivity from layer 1 to final layer"""
+        logger.info("Adding pipeline connectivity constraints...")
+        
+        # PERFORMANCE: Pre-index connections by source and destination segment
+        # This reduces O(layers × segments × connections) to O(connections + constraints)
+        logger.info(f"  Pre-indexing {len(self.valid_connections)} connections for fast lookup...")
+        from collections import defaultdict
+        connections_from = defaultdict(list)  # seg1 -> [(seg1, seg2), ...]
+        connections_to = defaultdict(list)    # seg2 -> [(seg1, seg2), ...]
+        
+        for conn in self.valid_connections:
+            seg1, seg2 = conn
+            connections_from[seg1].append(conn)
+            connections_to[seg2].append(conn)
+        
+        logger.info(f"  Indexed {len(connections_from)} source segments and {len(connections_to)} destination segments")
+        
         # Pipeline must start at layer 1
         first_layer_segments = [seg for seg in self.valid_segments if seg[4] == 1]
         if first_layer_segments:
@@ -1378,32 +1425,48 @@ class LLMPlacementSolverWithTP:
             )
         
         # Sequential connectivity
+        total_layers = self.config.num_decoder_layers
+        logger.info(f"  Processing {total_layers-1} layer transitions...")
+        constraints_added = 0
+        
         for layer in range(1, self.config.num_decoder_layers):
+            if layer % 10 == 0:
+                logger.info(f"  Progress: {layer}/{total_layers-1} layer transitions ({constraints_added} constraints so far)")
             segments_ending_here = [seg for seg in self.valid_segments
                                    if seg[4] + seg[5] - 1 == layer]
             segments_starting_next = [seg for seg in self.valid_segments
                                      if seg[4] == layer + 1]
             
             if segments_ending_here and segments_starting_next:
+                # PERFORMANCE: Use pre-indexed connections instead of searching
+                segments_starting_next_set = set(segments_starting_next)
+                
                 # Outgoing connections
                 for seg1 in segments_ending_here:
-                    valid_next_connections = [(s1, s2) for (s1, s2) in self.valid_connections 
-                                             if s1 == seg1 and s2 in segments_starting_next]
+                    # Use indexed lookup instead of iterating all connections
+                    valid_next_connections = [conn for conn in connections_from[seg1]
+                                            if conn[1] in segments_starting_next_set]
                     if valid_next_connections:
                         self.model.addConstr(
                             gp.quicksum(self.e[s1, s2] for (s1, s2) in valid_next_connections) >= self.x[seg1],
                             name=f"connectivity_out_{layer}"
                         )
+                        constraints_added += 1
                 
                 # Incoming connections
+                segments_ending_here_set = set(segments_ending_here)
                 for seg2 in segments_starting_next:
-                    valid_prev_connections = [(s1, s2) for (s1, s2) in self.valid_connections 
-                                             if s2 == seg2 and s1 in segments_ending_here]
+                    # Use indexed lookup instead of iterating all connections
+                    valid_prev_connections = [conn for conn in connections_to[seg2]
+                                            if conn[0] in segments_ending_here_set]
                     if valid_prev_connections:
                         self.model.addConstr(
                             gp.quicksum(self.e[s1, s2] for (s1, s2) in valid_prev_connections) >= self.x[seg2],
                             name=f"connectivity_in_{layer}"
                         )
+                        constraints_added += 1
+        
+        logger.info(f"  Pipeline connectivity: added {constraints_added} constraints successfully")
     
     def _add_symmetry_breaking_constraints(self):
         """Add symmetry breaking for identical TP partitions"""
@@ -1541,7 +1604,19 @@ class LLMPlacementSolverWithTP:
             logger.info(f"\nIteration {iteration + 1}/{max_iterations}:")
             logger.info(f"  Cost budget: ${initial_budget:.2f}/hour")
             
-            # Set budget and solve
+            # Update budget constraint efficiently
+            if self.budget_constraint is None:
+                # Add budget constraint if it doesn't exist
+                self.budget_constraint = self.model.addConstr(
+                    self.cost <= initial_budget,
+                    name="cost_budget"
+                )
+                self.model.update()
+            else:
+                # Update existing constraint RHS
+                self.budget_constraint.setAttr('RHS', initial_budget)
+                self.model.update()
+            
             original_budget = self.config.max_hourly_cost
             self.config.max_hourly_cost = initial_budget
             
@@ -1625,7 +1700,7 @@ class LLMPlacementSolverWithTP:
         
         # Apply absolute bounds for safety
         min_budget = max(0.20, min_budget)
-        max_budget = min(20.0, max_budget)
+        max_budget = min(100.0, max_budget)  # Increased from 20.0 to allow exploring higher TP degrees
         
         # If target_cpt is very restrictive (< $0.0001/token), narrow the range
         # Typical LLM $/token is $0.00001 - $0.0001
@@ -1637,6 +1712,30 @@ class LLMPlacementSolverWithTP:
         logger.info(f"Competitive budget range for $/token <= ${target_cpt:.9f}:")
         logger.info(f"  GPU cost range: ${min_cost:.2f} - ${max_cost:.2f}/hour")
         logger.info(f"  Search budget range: ${min_budget:.2f} - ${max_budget:.2f}/hour")
+        
+        # Log which configurations will/won't be covered
+        logger.info(f"\nConfiguration Coverage Analysis:")
+        covered = []
+        not_covered = []
+        for gpu_type, gpu_info in self.gpu_types.items():
+            for tp_degree in [1, 2, 4, 8]:
+                if tp_degree > gpu_info.count:
+                    continue
+                config_cost = gpu_info.cost_per_hour * tp_degree
+                if config_cost <= max_budget:
+                    covered.append(f"{gpu_type} TP={tp_degree} (${config_cost:.2f}/h)")
+                else:
+                    not_covered.append(f"{gpu_type} TP={tp_degree} (${config_cost:.2f}/h)")
+        
+        if covered:
+            logger.info(f"  ✓ Will explore ({len(covered)} configs):")
+            for config in covered:
+                logger.info(f"    {config}")
+        
+        if not_covered:
+            logger.warning(f"  ✗ Budget too low for ({len(not_covered)} configs):")
+            for config in not_covered:
+                logger.warning(f"    {config} - need budget >= ${config.split('$')[1].split('/')[0]}")
         
         return (min_budget, max_budget)
     
@@ -1668,10 +1767,12 @@ class LLMPlacementSolverWithTP:
             if use_smart_hybrid:
                 # SMART HYBRID: Use iterative to find ballpark, then enumerate around it
                 logger.info("\nPhase 1: Iterative search to find ballpark...")
+                phase1_start = time.time()
                 if self.solve_for_min_cost_per_token(max_iterations=3):
+                    phase1_time = time.time() - phase1_start
                     ballpark_cost = self.solution['cost_per_hour']
                     ballpark_cpt = self.solution['cost_per_token']
-                    logger.info(f"Ballpark found: ${ballpark_cost:.2f}/h, ${ballpark_cpt:.9f}/token")
+                    logger.info(f"Ballpark found: ${ballpark_cost:.2f}/h, ${ballpark_cpt:.9f}/token (Phase 1 time: {phase1_time:.1f}s)")
                     
                     # Check if ballpark meets target
                     if ballpark_cpt <= self.config.max_cost_per_token:
@@ -1696,7 +1797,8 @@ class LLMPlacementSolverWithTP:
                     logger.info(f"  Budget range: ${min(budget_points):.2f} - ${max(budget_points):.2f}/hour")
                 else:
                     # Fallback to coarse range if iterative fails
-                    logger.warning("Iterative failed, using coarse enumeration in feasible range...")
+                    phase1_time = time.time() - phase1_start
+                    logger.warning(f"Iterative failed (Phase 1 time: {phase1_time:.1f}s), using coarse enumeration in feasible range...")
                     # COMPETITIVE OPTIMIZATION: Focus on budgets that can meet target
                     # Generate 8 strategic points within feasible range
                     budget_points = np.logspace(
@@ -1728,14 +1830,51 @@ class LLMPlacementSolverWithTP:
         # Set to maximize throughput (weight=0)
         self.config.cost_throughput_weight = 0.0
         
+        # PERFORMANCE OPTIMIZATION: Build model ONCE, then update budget constraint
+        # This avoids rebuilding all constraints 6-8 times (minutes saved!)
+        logger.info("Building model once (this may take a few minutes)...")
+        model_build_start = time.time()
+        self.config.max_hourly_cost = max(budget_points)  # Start with highest budget
+        self.build_model()
+        model_build_time = time.time() - model_build_start
+        logger.info(f"Model built in {model_build_time:.1f}s! Now testing budgets by updating constraint RHS only...")
+        
         for i, budget in enumerate(sorted(budget_points)):
+            iteration_start = time.time()
             logger.info(f"\n[{i+1}/{len(budget_points)}] Budget: ${budget:.2f}/hour")
             
-            self.config.max_hourly_cost = budget
+            # Log which TP configurations are feasible at this budget
+            feasible_configs = []
+            for gpu_type, gpu_info in self.gpu_types.items():
+                for tp_degree in [1, 2, 4, 8]:
+                    if tp_degree > gpu_info.count:
+                        continue
+                    config_cost = gpu_info.cost_per_hour * tp_degree
+                    if config_cost <= budget:
+                        feasible_configs.append(f"{gpu_type}×{tp_degree}")
+            if feasible_configs:
+                logger.info(f"  Feasible configs: {', '.join(feasible_configs)}")
             
-            # Rebuild model with new budget constraint
-            self.build_model()
+            # Update budget constraint RHS efficiently (no model rebuild!)
+            constraint_update_start = time.time()
+            if self.budget_constraint is None:
+                # First iteration or no budget constraint - add one
+                self.budget_constraint = self.model.addConstr(
+                    self.cost <= budget,
+                    name="cost_budget"
+                )
+                self.model.update()
+            else:
+                # Update existing constraint RHS (FAST!)
+                self.budget_constraint.setAttr('RHS', budget)
+                self.model.update()
+            constraint_update_time = time.time() - constraint_update_start
+            logger.info(f"  Constraint update: {constraint_update_time:.3f}s")
+            
+            solve_start = time.time()
             success = self.solve()
+            solve_time = time.time() - solve_start
+            iteration_time = time.time() - iteration_start
             
             if success:
                 cpt = self.solution['cost_per_token']
@@ -1743,6 +1882,7 @@ class LLMPlacementSolverWithTP:
                 cost = self.solution['cost_per_hour']
                 
                 logger.info(f"  Result: {throughput:.0f} tokens/s, ${cost:.2f}/h, ${cpt:.9f}/token")
+                logger.info(f"  Timing: solve={solve_time:.1f}s, total iteration={iteration_time:.1f}s")
                 
                 all_results.append({
                     'budget': budget,
@@ -1757,11 +1897,48 @@ class LLMPlacementSolverWithTP:
                     best_solution = self.solution.copy()
                     logger.info(f"  OK New best $/token!")
             else:
-                logger.info(f"Infeasible")
+                logger.info(f"  Infeasible")
+                logger.info(f"  Timing: solve={solve_time:.1f}s, total iteration={iteration_time:.1f}s")
         
         # Restore original config
         self.config.max_hourly_cost = original_budget
         self.config.cost_throughput_weight = original_weight
+        
+        total_enumeration_time = time.time() - model_build_start
+        logger.info(f"\nTotal enumeration time: {total_enumeration_time:.1f}s (model build: {model_build_time:.1f}s, solving: {total_enumeration_time - model_build_time:.1f}s)")
+        
+        # Log coverage summary
+        logger.info(f"\n{'='*80}")
+        logger.info(f"ENUMERATION COVERAGE SUMMARY")
+        logger.info(f"{'='*80}")
+        logger.info(f"Budget points tested: {len(budget_points)}")
+        logger.info(f"Budget range: ${min(budget_points):.2f} - ${max(budget_points):.2f}/hour")
+        
+        # Check which configs were fully explored
+        max_budget_tested = max(budget_points)
+        all_configs = []
+        explored = []
+        not_explored = []
+        for gpu_type, gpu_info in self.gpu_types.items():
+            for tp_degree in [1, 2, 4, 8]:
+                if tp_degree > gpu_info.count:
+                    continue
+                config_cost = gpu_info.cost_per_hour * tp_degree
+                config_name = f"{gpu_type} TP={tp_degree}"
+                all_configs.append((config_name, config_cost))
+                if config_cost <= max_budget_tested:
+                    explored.append((config_name, config_cost))
+                else:
+                    not_explored.append((config_name, config_cost))
+        
+        logger.info(f"\n✓ Explored: {len(explored)}/{len(all_configs)} configurations")
+        for name, cost in explored:
+            logger.info(f"  {name:<20} ${cost:.2f}/h")
+        
+        if not_explored:
+            logger.warning(f"\n✗ NOT explored: {len(not_explored)} configurations (budget too low)")
+            for name, cost in not_explored:
+                logger.warning(f"  {name:<20} ${cost:.2f}/h (need >= ${cost:.2f}/h budget)")
         
         if best_solution:
             self.solution = best_solution
@@ -1812,7 +1989,11 @@ class LLMPlacementSolverWithTP:
                 threads = min(available_threads, 4)
         
         self.model.setParam('Threads', threads)
-        logger.info(f"Using {threads} threads for optimization")
+        
+        # DIAGNOSTIC: Verify thread setting
+        actual_threads = self.model.getParamInfo('Threads')[2]  # Get current value
+        logger.info(f"Using {threads} threads for optimization (verified: {actual_threads})")
+        logger.info(f"CPU count: {os.cpu_count()}, available: {available_threads}")
         
         logger.info("Starting optimization...")
         start_time = time.time()
@@ -1821,8 +2002,15 @@ class LLMPlacementSolverWithTP:
             self.model.optimize()
             solve_time = time.time() - start_time
             
+            # DIAGNOSTIC: Log if solved in presolve
+            if self.model.status == GRB.OPTIMAL and self.model.NodeCount == 0:
+                logger.warning(f"WARNING: Problem solved in presolve (single-threaded)! NodeCount=0")
+                logger.warning(f"  Presolve eliminated problem before multi-threaded B&B could start")
+            
             if self.model.status == GRB.OPTIMAL:
                 logger.info(f"Optimal solution found in {solve_time:.2f} seconds")
+                logger.info(f"  Nodes explored: {self.model.NodeCount}")
+                logger.info(f"  Simplex iterations: {self.model.IterCount}")
                 logger.info(f"Optimal throughput: {self.t.x:.2f} tokens/sec")
                 self._extract_solution()
                 return True
@@ -2753,7 +2941,7 @@ def main():
         logger.error(f"Solver failed: {e}")
         import traceback
         traceback.print_exc()
-        return 1g
+        return 1
     
     end_time = time.time()
     logger.info(f"Total time: {end_time - start_time:.0f} seconds")
