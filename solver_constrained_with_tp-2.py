@@ -2011,6 +2011,7 @@ class LLMPlacementSolverWithTP:
         
         if best_solution:
             self.solution = best_solution
+            self.all_enumeration_results = all_results  # Store for CSV export
             best_cpm = best_cpt * 1_000_000
             logger.info(f"\n{'='*80}")
             logger.info(f"OPTIMAL $/M TOKENS FOUND")
@@ -2713,6 +2714,111 @@ class LLMPlacementSolverWithTP:
             json.dump(output_data, f, indent=2)
         
         logger.info(f"Solution saved to {output_file}")
+    
+    def save_solution_csv(self, output_file: str, include_all_results: bool = True):
+        """
+        Save solution summary to CSV file.
+        
+        Args:
+            output_file: Path to output CSV file
+            include_all_results: If True and enumeration was used, save all explored solutions.
+                                If False, save only the best solution.
+        """
+        if not self.solution:
+            logger.error("No solution available to save")
+            return
+        
+        import csv
+        
+        # Check if we have enumeration results
+        has_enumeration = hasattr(self, 'all_enumeration_results') and self.all_enumeration_results
+        
+        if include_all_results and has_enumeration:
+            # Save all enumeration results
+            rows = []
+            for result in sorted(self.all_enumeration_results, key=lambda x: x['cost_per_token']):
+                sol = result['solution']
+                
+                # Extract GPU info
+                gpu_type = ''
+                tp_degree = ''
+                num_gpus = ''
+                total_layers = ''
+                
+                if sol['gpu_assignments']:
+                    first_assignment = sol['gpu_assignments'][0]
+                    gpu_type = first_assignment['gpu_type']
+                    tp_degree = first_assignment['tp_degree']
+                    num_gpus = len(first_assignment['gpu_ids'])
+                    total_layers = sum(a['segment_size'] for a in sol['gpu_assignments'])
+                
+                cost_per_million = result['cost_per_token'] * 1_000_000
+                is_best = (result['cost_per_token'] == min(r['cost_per_token'] for r in self.all_enumeration_results))
+                
+                rows.append({
+                    'batch_size': sol.get('batch_size', ''),
+                    'budget_tested': f"{result['budget']:.2f}",
+                    'throughput_tokens_per_sec': f"{result['throughput']:.2f}",
+                    'cost_per_hour': f"{result['cost']:.2f}",
+                    'cost_per_million_tokens': f"{cost_per_million:.6f}",
+                    'pipeline_stages': sol['num_pipeline_stages'],
+                    'gpu_type': gpu_type,
+                    'tp_degree': tp_degree,
+                    'num_gpus': num_gpus,
+                    'total_layers': total_layers,
+                    'is_best': 'YES' if is_best else 'NO',
+                    'status': 'SUCCESS'
+                })
+            
+            # Write CSV with all results
+            with open(output_file, 'w', newline='') as f:
+                fieldnames = ['batch_size', 'budget_tested', 'throughput_tokens_per_sec', 'cost_per_hour', 
+                             'cost_per_million_tokens', 'pipeline_stages', 'gpu_type', 
+                             'tp_degree', 'num_gpus', 'total_layers', 'is_best', 'status']
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+            
+            logger.info(f"Solution CSV saved with {len(rows)} enumeration results to {output_file}")
+        else:
+            # Save only the best solution (original behavior)
+            gpu_type = ''
+            tp_degree = ''
+            num_gpus = ''
+            total_layers = ''
+            
+            if self.solution['gpu_assignments']:
+                first_assignment = self.solution['gpu_assignments'][0]
+                gpu_type = first_assignment['gpu_type']
+                tp_degree = first_assignment['tp_degree']
+                num_gpus = len(first_assignment['gpu_ids'])
+                total_layers = sum(a['segment_size'] for a in self.solution['gpu_assignments'])
+            
+            cost_per_million = self.solution['cost_per_token'] * 1_000_000
+            
+            row = {
+                'batch_size': self.solution.get('batch_size', ''),
+                'throughput_tokens_per_sec': f"{self.solution['throughput_tokens_per_sec']:.2f}",
+                'cost_per_hour': f"{self.solution['cost_per_hour']:.2f}",
+                'cost_per_million_tokens': f"{cost_per_million:.6f}",
+                'pipeline_stages': self.solution['num_pipeline_stages'],
+                'gpu_type': gpu_type,
+                'tp_degree': tp_degree,
+                'num_gpus': num_gpus,
+                'total_layers': total_layers,
+                'status': 'SUCCESS'
+            }
+            
+            # Write CSV (with header)
+            with open(output_file, 'w', newline='') as f:
+                fieldnames = ['batch_size', 'throughput_tokens_per_sec', 'cost_per_hour', 
+                             'cost_per_million_tokens', 'pipeline_stages', 'gpu_type', 
+                             'tp_degree', 'num_gpus', 'total_layers', 'status']
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerow(row)
+            
+            logger.info(f"Solution CSV saved to {output_file}")
 
 
 def filter_tp_configurations_by_hierarchy(gpu_types: Dict[str, GPUType], 
@@ -3014,6 +3120,10 @@ def main():
                 solver.print_solution()
                 output_file = os.path.join(args.config_dir, 'solution_with_tp.json')
                 solver.save_solution(output_file)
+                
+                # Also save CSV summary
+                csv_file = os.path.join(args.config_dir, 'solution_summary.csv')
+                solver.save_solution_csv(csv_file)
             else:
                 logger.error("Failed to find optimal solution")
                 return 1
