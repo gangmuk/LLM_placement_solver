@@ -158,39 +158,41 @@ class ThroughputFunctions:
         Returns:
             Arithmetic intensity in FLOPs per byte
         """
-        # === FLOPs Calculation (per layer, per token) ===
+        # === FLOPs Calculation (for full batch) ===
         # Attention: Q, K, V, O projections (4 × 2D²) + attention scores (4D×seq)
-        flops_attn_proj = 4 * 2 * d_model * d_model  # 4 projections
-        flops_attn_scores = 4 * seq_len * d_model  # QK^T + softmax*V
+        # CRITICAL: Must multiply by batch_size AND seq_len for total FLOPs!
+        flops_attn_proj = 4 * 2 * batch_size * seq_len * d_model * d_model  # 4 projections
+        flops_attn_scores = 4 * batch_size * seq_len * seq_len * d_model  # QK^T + softmax*V
         flops_attention = flops_attn_proj + flops_attn_scores
         
         # FFN: typically 3 projections (up, down, gate) for SwiGLU
         # up: D→d_hidden, gate: D→d_hidden, down: d_hidden→D
-        flops_ffn = (2 * d_model * d_hidden +  # up projection
-                     2 * d_model * d_hidden +  # gate projection  
-                     2 * d_hidden * d_model)   # down projection
+        flops_ffn = 2 * batch_size * seq_len * (
+            d_model * d_hidden +  # up projection
+            d_model * d_hidden +  # gate projection
+            d_hidden * d_model    # down projection
+        )
         
-        # Total FLOPs for the segment
-        flops_per_token = (flops_attention + flops_ffn) * num_layers
-        total_flops = flops_per_token * batch_size
+        # Total FLOPs for the segment (already includes batch_size and seq_len)
+        flops_per_layer = flops_attention + flops_ffn
+        total_flops = flops_per_layer * num_layers
         
-        # === Memory Access Calculation (per layer, per token) ===
+        # === Memory Access Calculation (for full batch) ===
         # Weights (divided by TP): (4D² for attention + 3D×d_hidden for FFN) per layer
         bytes_weights_per_layer = (
             4 * d_model * d_model +  # Attention projections (Q, K, V, O)
             3 * d_model * d_hidden   # FFN projections (up, gate, down)
         ) * bytes_per_element / tp_degree
         
-        # KV cache per layer: 2 (K+V) × seq_len × D (sharded by TP)
-        bytes_kv_cache_per_layer = 2 * seq_len * d_model * bytes_per_element / tp_degree
+        # KV cache per layer: 2 (K+V) × batch × seq_len × D (sharded by TP)
+        bytes_kv_cache_per_layer = 2 * batch_size * seq_len * d_model * bytes_per_element / tp_degree
         
-        # Activations per layer: hidden dimension
-        bytes_activations_per_layer = d_model * bytes_per_element
+        # Activations per layer: batch × seq × hidden
+        bytes_activations_per_layer = batch_size * seq_len * d_model * bytes_per_element
         
-        # Total memory access per token
-        bytes_per_token = (bytes_weights_per_layer + bytes_kv_cache_per_layer + 
-                          bytes_activations_per_layer) * num_layers
-        total_bytes = bytes_per_token * batch_size
+        # Total memory access for the full batch
+        bytes_per_layer = bytes_weights_per_layer + bytes_kv_cache_per_layer + bytes_activations_per_layer
+        total_bytes = bytes_per_layer * num_layers
         
         # Arithmetic Intensity = FLOPs / Bytes
         if total_bytes == 0:
@@ -318,7 +320,8 @@ class ThroughputFunctions:
     @staticmethod
     def gpu_throughput_with_tp(gpu_type: str, seq_len: int, batch_size: int, 
                                num_layers: int, d_model: int, bytes_per_element: int, 
-                               tp_degree: int, d_hidden: int = None, nvlink_bw_gbps: float = 300.0) -> float:
+                               tp_degree: int, d_hidden: int = None, nvlink_bw_gbps: float = 300.0,
+                               debug: bool = False) -> float:
         """
         GPU throughput with tensor parallelism using roofline model.
         
@@ -338,6 +341,7 @@ class ThroughputFunctions:
             tp_degree: Tensor parallelism degree
             d_hidden: FFN intermediate dimension (defaults to 4*d_model)
             nvlink_bw_gbps: NVLink bandwidth in GB/s (from network topology, NOT hardcoded)
+            debug: Enable debug logging
         
         Returns:
             Throughput in tokens/second with TP (NOT multiplied by tp_degree!)
@@ -348,6 +352,12 @@ class ThroughputFunctions:
         
         specs = ThroughputFunctions.GPU_SPECS.get(gpu_type, ThroughputFunctions.GPU_SPECS['A100'])
         
+        if debug:
+            logger.info(f"\n{'='*80}")
+            logger.info(f"DEBUG: gpu_throughput_with_tp called")
+            logger.info(f"  GPU: {gpu_type}, TP={tp_degree}, batch={batch_size}, seq={seq_len}, layers={num_layers}")
+            logger.info(f"  d_model={d_model}, d_hidden={d_hidden}, nvlink_bw={nvlink_bw_gbps} GB/s")
+        
         # === Roofline Model Analysis with TP ===
         arithmetic_intensity = ThroughputFunctions.calculate_arithmetic_intensity(
             num_layers, batch_size, seq_len, d_model, d_hidden, bytes_per_element, tp_degree
@@ -355,6 +365,11 @@ class ThroughputFunctions:
         
         ridge_point = ThroughputFunctions.get_ridge_point(gpu_type)
         regime = ThroughputFunctions.determine_regime(arithmetic_intensity, ridge_point)
+        
+        if debug:
+            logger.info(f"  Arithmetic Intensity: {arithmetic_intensity:.2f} FLOPs/byte")
+            logger.info(f"  Ridge Point: {ridge_point:.2f} FLOPs/byte")
+            logger.info(f"  Regime: {regime}")
         
         # === Compute FLOPs PER GPU (with TP, each GPU does less compute) ===
         # Attention projections: each GPU computes D/tp × D/tp matmuls
@@ -372,6 +387,10 @@ class ThroughputFunctions:
         flops_per_layer = attn_proj_flops + attn_score_flops + ffn_flops
         total_flops_per_gpu = num_layers * flops_per_layer
         
+        if debug:
+            logger.info(f"  FLOPs per layer: {flops_per_layer:.2e}")
+            logger.info(f"  Total FLOPs (×{num_layers} layers): {total_flops_per_gpu:.2e}")
+        
         # === Compute Memory Access PER GPU (weights sharded by TP) ===
         # Weights are sharded across TP GPUs
         weight_bytes = num_layers * (4 * d_model * (d_model / tp_degree) + 
@@ -383,11 +402,21 @@ class ThroughputFunctions:
         
         total_bytes_per_gpu = weight_bytes + activation_bytes + kv_cache_bytes
         
+        if debug:
+            logger.info(f"  Total memory: {total_bytes_per_gpu / 1e9:.2f} GB")
+        
         # === Calculate Throughput Based on Regime ===
         if regime == "COMPUTE_BOUND":
             time_per_batch = total_flops_per_gpu / (specs['tflops'] * 1e12 * specs['efficiency'])
         else:  # MEMORY_BOUND
             time_per_batch = total_bytes_per_gpu / (specs['mem_bw'] * 1e9 * specs['efficiency'])
+        
+        if debug:
+            compute_time = total_flops_per_gpu / (specs['tflops'] * 1e12 * specs['efficiency'])
+            memory_time = total_bytes_per_gpu / (specs['mem_bw'] * 1e9 * specs['efficiency'])
+            logger.info(f"  Compute time: {compute_time:.4f} sec")
+            logger.info(f"  Memory time: {memory_time:.4f} sec")
+            logger.info(f"  Time per batch: {time_per_batch:.4f} sec")
         
         # === Add Communication Overhead ===
         # All-reduce after each layer: 2× data transfer (reduce-scatter + all-gather)
@@ -398,14 +427,30 @@ class ThroughputFunctions:
         comm_time_per_layer = 2 * activation_size_bytes / (nvlink_bw_gbps * 1e9) * (tp_degree - 1) / tp_degree
         total_comm_time = num_layers * comm_time_per_layer
         
+        if debug:
+            logger.info(f"  Comm time per layer: {comm_time_per_layer * 1000:.4f} ms")
+            logger.info(f"  Total comm time: {total_comm_time:.4f} sec")
+        
         # Total time = compute/memory time + communication time
         total_time = time_per_batch + total_comm_time
         
         tokens_per_batch = batch_size * seq_len
         base_throughput = tokens_per_batch / total_time
         
+        batch_eff = ThroughputFunctions.batch_efficiency_factor(batch_size)
+        
+        if debug:
+            logger.info(f"  Total time: {total_time:.4f} sec")
+            logger.info(f"  Tokens per batch: {tokens_per_batch:,}")
+            logger.info(f"  Base throughput: {base_throughput:,.0f} tokens/sec")
+            logger.info(f"  Batch efficiency: {batch_eff:.2f}")
+        
         # Apply batch efficiency
-        base_throughput *= ThroughputFunctions.batch_efficiency_factor(batch_size)
+        base_throughput *= batch_eff
+        
+        if debug:
+            logger.info(f"  FINAL throughput: {base_throughput:,.0f} tokens/sec")
+            logger.info(f"{'='*80}\n")
         
         # NOTE: We do NOT multiply by tp_degree here!
         # TP is not data parallelism - it processes the same batch across GPUs
