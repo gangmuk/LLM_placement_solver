@@ -405,16 +405,38 @@ class ThroughputFunctions:
         if debug:
             logger.info(f"  Total memory: {total_bytes_per_gpu / 1e9:.2f} GB")
         
+        # === TP Efficiency Factor ===
+        # TP doesn't scale perfectly due to:
+        # 1. Memory bandwidth contention (multiple GPUs reading weights)
+        # 2. Synchronization overhead (barriers between layers)
+        # 3. Load imbalance (some GPUs finish slightly earlier)
+        # 4. Framework overhead (PyTorch/CUDA TP management)
+        # Real-world measurements show TP efficiency decreases with degree
+        tp_efficiency_compute = {
+            1: 1.00,   # No TP overhead
+            2: 0.90,   # ~10% overhead (sync, memory contention)
+            4: 0.75,   # ~25% overhead
+            8: 0.60,   # ~40% overhead
+            16: 0.45   # ~55% overhead
+        }.get(tp_degree, 0.40)  # Default for higher TP
+        
         # === Calculate Throughput Based on Regime ===
         if regime == "COMPUTE_BOUND":
-            time_per_batch = total_flops_per_gpu / (specs['tflops'] * 1e12 * specs['efficiency'])
+            # Apply TP efficiency penalty to compute time
+            time_per_batch = total_flops_per_gpu / (specs['tflops'] * 1e12 * specs['efficiency'] * tp_efficiency_compute)
         else:  # MEMORY_BOUND
-            time_per_batch = total_bytes_per_gpu / (specs['mem_bw'] * 1e9 * specs['efficiency'])
+            # Memory bandwidth is MORE constrained with TP (multiple GPUs competing)
+            # Each GPU needs to read its weights, causing contention
+            tp_efficiency_memory = tp_efficiency_compute * 0.8  # Even worse for memory
+            time_per_batch = total_bytes_per_gpu / (specs['mem_bw'] * 1e9 * specs['efficiency'] * tp_efficiency_memory)
         
         if debug:
-            compute_time = total_flops_per_gpu / (specs['tflops'] * 1e12 * specs['efficiency'])
+            compute_time_no_tp = total_flops_per_gpu / (specs['tflops'] * 1e12 * specs['efficiency'])
+            compute_time_with_tp = total_flops_per_gpu / (specs['tflops'] * 1e12 * specs['efficiency'] * tp_efficiency_compute)
             memory_time = total_bytes_per_gpu / (specs['mem_bw'] * 1e9 * specs['efficiency'])
-            logger.info(f"  Compute time: {compute_time:.4f} sec")
+            logger.info(f"  TP efficiency: {tp_efficiency_compute:.2%}")
+            logger.info(f"  Compute time (no TP penalty): {compute_time_no_tp:.4f} sec")
+            logger.info(f"  Compute time (with TP penalty): {compute_time_with_tp:.4f} sec")
             logger.info(f"  Memory time: {memory_time:.4f} sec")
             logger.info(f"  Time per batch: {time_per_batch:.4f} sec")
         
