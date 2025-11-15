@@ -470,8 +470,15 @@ class ThroughputFunctions:
         # Apply batch efficiency
         base_throughput *= batch_eff
         
+        # NOTE: This is PER-STAGE throughput for a pipeline
+        # The actual end-to-end throughput will be limited by:
+        # 1. Slowest stage (already modeled via bottleneck constraint)
+        # 2. Pipeline bubbles (modeled at the solver level, not here)
+        # 3. Inter-stage communication (modeled separately)
+        
         if debug:
-            logger.info(f"  FINAL throughput: {base_throughput:,.0f} tokens/sec")
+            logger.info(f"  FINAL per-stage throughput: {base_throughput:,.0f} tokens/sec")
+            logger.info(f"  (Pipeline efficiency applied at solver level)")
             logger.info(f"{'='*80}\n")
         
         # NOTE: We do NOT multiply by tp_degree here!
@@ -2279,8 +2286,47 @@ class LLMPlacementSolverWithTP:
     def _extract_solution(self):
         """Extract solution from solved model"""
         # Compute metrics
-        throughput_per_sec = self.t.x
+        raw_throughput = self.t.x
         cost_per_hour = self.cost.x
+        
+        # Count number of pipeline stages in solution
+        num_stages = sum(1 for key in self.z.keys() if self.z[key].x > 0.5)
+        
+        # Apply pipeline bubble efficiency
+        # Pipeline bubbles occur because not all stages are active simultaneously
+        # Efficiency decreases with more stages
+        pipeline_efficiency = {
+            1: 1.00,   # No pipeline, no bubbles
+            2: 0.90,   # ~10% bubble overhead
+            3: 0.80,   # ~20% bubble overhead
+            4: 0.70,   # ~30% bubble overhead
+            5: 0.65,   # ~35% bubble overhead
+            6: 0.62,   # ~38% bubble overhead
+            7: 0.60,   # ~40% bubble overhead
+            8: 0.60,   # ~40% bubble overhead (consistent with expert estimate)
+        }.get(num_stages, max(0.50, 1.0 - 0.05 * num_stages))  # Degrade further for higher PP
+        
+        # Apply real-world efficiency factor
+        # Accounts for factors we don't model explicitly:
+        # - Prefill phase (slower than decode, we model something in between)
+        # - Framework overhead (PyTorch, vLLM, DeepSpeed scheduling)
+        # - Memory pressure (swapping, CPU offloading for tight memory)
+        # - Request batching inefficiencies
+        # - Gradient checkpointing overhead
+        # - Dynamic vs static batching differences
+        # Based on expert estimates: our model is ~3-4× too optimistic even after pipeline bubbles
+        real_world_efficiency = 0.30  # 70% overhead from all the above factors
+        
+        throughput_per_sec = raw_throughput * pipeline_efficiency * real_world_efficiency
+        
+        logger.info(f"\nThroughput Corrections:")
+        logger.info(f"  Pipeline stages: {num_stages}")
+        logger.info(f"  Pipeline bubble efficiency: {pipeline_efficiency:.1%}")
+        logger.info(f"  Real-world efficiency: {real_world_efficiency:.1%}")
+        logger.info(f"  Combined efficiency: {pipeline_efficiency * real_world_efficiency:.1%}")
+        logger.info(f"  Raw throughput: {raw_throughput:.2f} tokens/sec")
+        logger.info(f"  After pipeline bubbles: {raw_throughput * pipeline_efficiency:.2f} tokens/sec")
+        logger.info(f"  Final throughput: {throughput_per_sec:.2f} tokens/sec")
         
         # $/token = ($/hour) / (tokens/sec × sec/hour)
         if throughput_per_sec > 0:

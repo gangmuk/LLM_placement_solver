@@ -1,0 +1,79 @@
+========================================================================
+BATCH SIZE SWEEP - Running 4 batch sizes in parallel
+========================================================================
+Batch sizes: 32 64 128 256
+Timestamp: 20251115_163218
+
+** [Batch 32] Starting solver...
+   Config dir: config/hal/output-20251115_163218/batch_32
+   Output log: config/hal/output-20251115_163218/batch_32/method_enumeration-network_400_200.txt
+   PID: 470451
+
+** [Batch 64] Starting solver...
+   Config dir: config/hal/output-20251115_163218/batch_64
+   Output log: config/hal/output-20251115_163218/batch_64/method_enumeration-network_400_200.txt
+   PID: 470458
+
+** [Batch 128] Starting solver...
+   Config dir: config/hal/output-20251115_163218/batch_128
+   Output log: config/hal/output-20251115_163218/batch_128/method_enumeration-network_400_200.txt
+   PID: 470466
+
+** [Batch 256] Starting solver...
+   Config dir: config/hal/output-20251115_163218/batch_256
+   Output log: config/hal/output-20251115_163218/batch_256/method_enumeration-network_400_200.txt
+   PID: 470471
+
+========================================================================
+All 4 solver processes started, waiting for completion...
+PIDs: 470451 470458 470466 470471
+========================================================================
+
+Waiting for batch size 32 (PID: 470451)...
+✓ [1/4] Batch 32 completed successfully
+
+Waiting for batch size 64 (PID: 470458)...
+✓ [2/4] Batch 64 completed successfully
+
+Waiting for batch size 128 (PID: 470466)...
+✓ [3/4] Batch 128 completed successfully
+
+Waiting for batch size 256 (PID: 470471)...
+✓ [4/4] Batch 256 completed successfully
+
+========================================================================
+All solvers completed! Analyzing results...
+========================================================================
+
+RESULTS SUMMARY:
+--------------------------------------------------------------------------------------------
+Batch Size   Throughput      Cost ($/h)      $/M tokens           Status                   
+--------------------------------------------------------------------------------------------
+32           8934.16         97.92           3.044493             ✓ SUCCESS (5 tested)   
+64           14226.98        195.84          3.823721             ✓ SUCCESS (5 tested)   
+128          14226.98        195.84          3.823721             ✓ SUCCESS (5 tested)   
+256          N/A             N/A             N/A                  ✗ FAILED               
+--------------------------------------------------------------------------------------------
+
+========================================================================
+🏆 BEST SOLUTION: Batch Size = 32
+========================================================================
+Cost per M tokens: $3.044493
+Log file: config/hal/output-20251115_163218/batch_32/method_enumeration-network_400_200.txt
+
+Best result directory: config/hal/output-20251115_163218/BEST_RESULT -> batch_32
+
+Detailed results from best solution:
+------------------------------------------------------------------------
+2025-11-15 16:33:01,459 - INFO - PERFORMANCE & COST METRICS:
+2025-11-15 16:33:01,459 - INFO - ----------------------------------------------------------------------------------------------------
+2025-11-15 16:33:01,459 - INFO -   Throughput:        8934.16 tokens/sec
+2025-11-15 16:33:01,459 - INFO -   Cost:              $97.92/hour
+2025-11-15 16:33:01,459 - INFO -   $/M tokens:        $3.044493
+2025-11-15 16:33:01,459 - INFO -   Objective Value:   8934.1635
+
+========================================================================
+Batch sweep complete!
+All results in: config/hal/output-20251115_163218/
+CSV results:    config/hal/output-20251115_163218/batch_sweep_results.csv
+========================================================================
