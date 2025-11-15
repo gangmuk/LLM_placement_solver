@@ -2,8 +2,8 @@ parameter,value
 sequence_length,4096
 min_batch_size,64
 max_batch_size,64
-model_name,llama-70b
-num_decoder_layers,40
+model_name,llama-8b
+num_decoder_layers,32
 d_model,8192
 d_hidden,22016
 vocab_size,32000

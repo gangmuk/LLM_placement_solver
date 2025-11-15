@@ -1,5 +1,0 @@
-gpu_type,count,memory_gb
-A100,6,48
-L20,8,48
-A10,4,24
-A40,4,48

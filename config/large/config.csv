@@ -1,6 +1,6 @@
 parameter,value
 sequence_length,2048
-min_batch_size,16
+min_batch_size,64
 max_batch_size,64
 model_name,llama-70b
 num_decoder_layers,80
@@ -17,6 +17,6 @@ max_pipeline_stages,8
 min_layers_per_stage,5
 cost_throughput_weight,0.95
 max_hourly_cost,999.0
-max_cost_per_token,0.002
+max_cost_per_token,0.0000001
 throughput_normalization,10000.0
 cost_normalization,1.0

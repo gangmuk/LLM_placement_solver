@@ -1625,20 +1625,20 @@ class LLMPlacementSolverWithTP:
         
         self.model.setObjective(obj_expr, GRB.MAXIMIZE)
     
-    def solve_for_min_cost_per_token(self, target_cpt: float = None, max_iterations: int = 5) -> bool:
+    def solve_for_min_cost_per_token(self, target_cost_per_token: float = None, max_iterations: int = 5) -> bool:
         """
         Iteratively solve to minimize $/token.
         
         Uses binary search on cost budget to find solution with best $/token.
         """
-        if target_cpt is None:
-            target_cpt = self.config.max_cost_per_token
+        if target_cost_per_token is None:
+            target_cost_per_token = self.config.max_cost_per_token
         
         logger.info(f"\n{'='*80}")
         logger.info(f"ITERATIVE $/M TOKENS OPTIMIZATION")
         logger.info(f"{'='*80}")
-        target_cpm = target_cpt * 1_000_000
-        logger.info(f"Target $/M tokens: ${target_cpm:.6f}")
+        target_cost_per_million_token = target_cost_per_token * 1_000_000
+        logger.info(f"Target $/M tokens: ${target_cost_per_million_token:.6f}")
         
         # Step 1: Estimate minimum throughput (single GPU, single layer, min batch)
         min_tp_estimates = []
@@ -1653,7 +1653,7 @@ class LLMPlacementSolverWithTP:
         t_min = min(min_tp_estimates) if min_tp_estimates else 100.0
         
         # Step 2: Initial cost budget (conservative)
-        initial_budget = target_cpt * t_min * 3600 * 10  # 10× margin
+        initial_budget = target_cost_per_token * t_min * 3600 * 10  # 10× margin
         
         logger.info(f"Estimated min throughput: {t_min:.1f} tokens/sec")
         logger.info(f"Initial cost budget: ${initial_budget:.2f}/hour")
@@ -1693,13 +1693,13 @@ class LLMPlacementSolverWithTP:
                     best_cpt = actual_cpt
                     best_solution = self.solution.copy()
                 
-                if actual_cpt <= target_cpt:
+                if actual_cpt <= target_cost_per_token:
                     logger.info(f" Meets target")
                     break
                 else:
                     # Tighten budget
                     throughput = self.solution['throughput_tokens_per_sec']
-                    new_budget = target_cpt * throughput * 3600 * 0.95
+                    new_budget = target_cost_per_token * throughput * 3600 * 0.95
                     logger.info(f"  Tightening budget to ${new_budget:.2f}/hour")
                     initial_budget = new_budget
             else:
@@ -1729,7 +1729,7 @@ class LLMPlacementSolverWithTP:
         Returns:
             (min_budget, max_budget) tuple in $/hour
         """
-        target_cpt = self.config.max_cost_per_token
+        target_cost_per_token = self.config.max_cost_per_token
         
         # Collect GPU costs to estimate range
         costs = []
@@ -1739,7 +1739,7 @@ class LLMPlacementSolverWithTP:
                 continue
             
             # For different TP degrees
-            for tp_degree in [1, 2, 4, 8]:
+            for tp_degree in [1, 2, 4, 8, 16]:
                 if tp_degree > gpu_info.count:
                     continue
                 
@@ -1760,21 +1760,20 @@ class LLMPlacementSolverWithTP:
         
         # Start with actual GPU costs as the range
         min_budget = min_cost * 0.8  # Slightly below cheapest config
-        max_budget = max_cost * 1.5  # Slightly above most expensive config
+        max_budget = max_cost * 1.5  # Slightly above most expensive single-TP config
+        
+        # Factor in multi-stage pipelines (can be much higher than single-stage)
+        if self.config.max_pipeline_stages > 1:
+            # Multi-stage could be: max_cost × max_stages
+            max_multi_stage = max_cost * self.config.max_pipeline_stages
+            max_budget = max(max_budget, max_multi_stage * 1.2)
         
         # Apply absolute bounds for safety
         min_budget = max(0.20, min_budget)
-        max_budget = min(100.0, max_budget)  # Increased from 20.0 to allow exploring higher TP degrees
+        # No aggressive upper cap - trust the enumeration to filter out infeasible high budgets
         
-        # If target_cpt is very restrictive (< $0.0001/token), narrow the range
-        # Typical LLM $/token is $0.00001 - $0.0001
-        if target_cpt < 0.0001:
-            # Very aggressive target - focus on cheaper GPUs
-            max_budget = min(max_budget, max_cost * 0.8)
-            logger.info(f"  Aggressive $/M tokens target detected, focusing on lower budgets")
-        
-        target_cpm_display = target_cpt * 1_000_000
-        logger.info(f"Competitive budget range for $/M tokens <= ${target_cpm_display:.6f}:")
+        target_cost_per_million_token_display = target_cost_per_token * 1_000_000
+        logger.info(f"Competitive budget range for $/M tokens <= ${target_cost_per_million_token_display:.6f}:")
         logger.info(f"  GPU cost range: ${min_cost:.2f} - ${max_cost:.2f}/hour")
         logger.info(f"  Search budget range: ${min_budget:.2f} - ${max_budget:.2f}/hour")
         
@@ -1822,8 +1821,8 @@ class LLMPlacementSolverWithTP:
         logger.info(f"\n{'='*80}")
         logger.info(f"OPTIMAL $/M TOKENS SEARCH {'(Smart Hybrid)' if use_smart_hybrid and budget_points is None else '(Full Enumeration)'}")
         logger.info(f"{'='*80}")
-        target_cpm_display = self.config.max_cost_per_token * 1_000_000
-        logger.info(f"Target $/M tokens (from config): ${target_cpm_display:.6f}")
+        target_cost_per_million_token_display = self.config.max_cost_per_token * 1_000_000
+        logger.info(f"Target $/M tokens (from config): ${target_cost_per_million_token_display:.6f}")
         
         # Auto-generate budget range if not provided
         if budget_points is None:
@@ -1842,11 +1841,11 @@ class LLMPlacementSolverWithTP:
                     logger.info(f"Ballpark found: ${ballpark_cost:.2f}/h, ${ballpark_cpm:.6f}/M tokens (Phase 1 time: {phase1_time:.1f}s)")
                     
                     # Check if ballpark meets target
-                    target_cpm = self.config.max_cost_per_token * 1_000_000
+                    target_cost_per_million_token = self.config.max_cost_per_token * 1_000_000
                     if ballpark_cpt <= self.config.max_cost_per_token:
-                        logger.info(f"Ballpark meets target (${ballpark_cpm:.6f} <= ${target_cpm:.6f})")
+                        logger.info(f"Ballpark meets target (${ballpark_cpm:.6f} <= ${target_cost_per_million_token:.6f})")
                     else:
-                        logger.warning(f"Ballpark exceeds target (${ballpark_cpm:.6f} > ${target_cpm:.6f})")
+                        logger.warning(f"Ballpark exceeds target (${ballpark_cpm:.6f} > ${target_cost_per_million_token:.6f})")
                     
                     # PERFORMANCE OPTIMIZATION: Reduced from 12 to 6-8 budget points
                     # COMPETITIVE OPTIMIZATION: Focus on range that can beat competitor
@@ -1858,7 +1857,7 @@ class LLMPlacementSolverWithTP:
                     # Add feasible range bounds to ensure we explore competitive region
                     budget_points.extend([min_feasible, max_feasible * 0.5, max_feasible])
                     
-                    # Filter to feasible range (don't waste time on budgets that can't meet target)
+                    # Filter to feasible range (max_feasible now accounts for multi-stage)
                     budget_points = [b for b in budget_points if min_feasible * 0.5 <= b <= max_feasible * 1.5]
                     budget_points = sorted(set(budget_points))  # Remove duplicates, sort
                     logger.info(f"  Using {len(budget_points)} coarse budget points focused on competitive range")
