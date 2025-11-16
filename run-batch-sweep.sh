@@ -217,9 +217,7 @@ echo ""
 
 # Announce the winner
 if [ -n "$best_batch_size" ]; then
-    echo "========================================================================"
-    echo "🏆 BEST SOLUTION: Batch Size = $best_batch_size"
-    echo "========================================================================"
+    echo "* Best batch size = $best_batch_size"
     echo "Cost per M tokens: \$${best_cost_per_token}"
     echo "Log file: ${best_log_path}"
     echo ""
@@ -230,8 +228,6 @@ if [ -n "$best_batch_size" ]; then
     echo ""
     
     # Show detailed results for best solution
-    echo "Detailed results from best solution:"
-    echo "------------------------------------------------------------------------"
     grep -A 5 "PERFORMANCE & COST METRICS:" "$best_log_path" | grep -v "^--" || true
     echo ""
 else
