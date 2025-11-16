@@ -1,4 +1,0 @@
-batch_size,budget_tested,throughput_tokens_per_sec,cost_per_hour,cost_per_million_tokens,pipeline_stages,gpu_type,tp_degree,num_gpus,total_layers,is_best,status
-64,97.92,18610212.41,97.92,0.001462,4,V100,8,8,80,YES,SUCCESS
-64,117.50,18610212.41,97.92,0.001462,4,V100,8,8,80,YES,SUCCESS
-64,146.88,18610212.41,97.92,0.001462,4,V100,8,8,80,YES,SUCCESS

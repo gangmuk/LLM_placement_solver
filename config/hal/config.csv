@@ -23,4 +23,4 @@ max_cost_per_token,0.00001
 max_total_cost,999999.0
 throughput_normalization,10000.0
 cost_normalization,1.0
-total_tokens_to_process,1000000000
+total_tokens_to_process,1000000
