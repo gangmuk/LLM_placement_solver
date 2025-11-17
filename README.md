@@ -10,7 +10,7 @@ Automatically find **optimal layer-to-GPU mappings** with Tensor + Pipeline para
 ```bash
 pip install -r requirements.txt
 ```
-**⚠️ Note**: Requires Gurobi license. [Get academic license here](https://www.gurobi.com/academia/academic-program-and-licenses/)
+**Note**: Requires Gurobi license.
 
 ### Basic Usage
 
