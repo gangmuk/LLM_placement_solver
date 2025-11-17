@@ -821,7 +821,7 @@ class LLMPlacementSolverWithTP:
             # Cost optimization parameters
             cost_throughput_weight=cost_throughput_weight,
             max_hourly_cost=float(config_dict['max_hourly_cost']),
-            max_cost_per_token=float(config_dict['max_cost_per_token']),
+            max_cost_per_token=float(config_dict['max_cost_per_million_token']) / 1_000_000,
             max_total_cost=float(config_dict['max_total_cost']),
             throughput_normalization=float(config_dict['throughput_normalization']),
             cost_normalization=float(config_dict['cost_normalization']),

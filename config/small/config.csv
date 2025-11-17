@@ -19,7 +19,7 @@ min_memory_utilization,0.5
 network_bandwidth_percentile_threshold,0.1
 optimization_priority,throughput_first
 max_hourly_cost,999.0
-max_cost_per_token,0.0001
+max_cost_per_million_token,100
 max_total_cost,999999.0
 throughput_normalization,10000.0
 cost_normalization,1.0
