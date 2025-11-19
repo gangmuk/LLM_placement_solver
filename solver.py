@@ -72,6 +72,7 @@ class Config:
     throughput_normalization: float
     cost_normalization: float
     total_tokens_to_process: int
+    max_total_runtime_hours: float
 
 # GPU performance tiers for hierarchy constraints
 GPU_PERFORMANCE_TIERS = {
@@ -825,7 +826,8 @@ class LLMPlacementSolverWithTP:
             max_total_cost=float(config_dict['max_total_cost']),
             throughput_normalization=float(config_dict['throughput_normalization']),
             cost_normalization=float(config_dict['cost_normalization']),
-            total_tokens_to_process=int(config_dict['total_tokens_to_process'])
+            total_tokens_to_process=int(config_dict['total_tokens_to_process']),
+            max_total_runtime_hours=float(config_dict['max_total_runtime_hours'])
         )
     
     def _get_min_intra_tp_bandwidth(self, gpu_type: str, gpu_set: FrozenSet[int]) -> float:
@@ -1559,6 +1561,22 @@ class LLMPlacementSolverWithTP:
                 name="total_cost_budget"
             )
             logger.info(f"Added total cost budget constraint: <= ${self.config.max_total_cost:.2f} for {self.config.total_tokens_to_process:,} tokens")
+        
+        # Total runtime constraint (if specified)
+        # Runtime = total_tokens / throughput_per_sec / 3600 (in hours)
+        # Runtime <= max_runtime_hours
+        # Rearranged: throughput >= total_tokens / (max_runtime_hours * 3600)
+        if self.config.max_total_runtime_hours < 999999.0:
+            min_required_throughput = self.config.total_tokens_to_process / (
+                self.config.max_total_runtime_hours * 3600
+            )
+            self.model.addConstr(
+                self.t >= min_required_throughput,
+                name="total_runtime_constraint"
+            )
+            logger.info(f"Added total runtime constraint: <= {self.config.max_total_runtime_hours:.2f} hours "
+                       f"(requires throughput >= {min_required_throughput:.2f} tokens/sec)")
+
         
         # 5. Network connection constraints
         for (seg1, seg2) in self.valid_connections:
@@ -2383,8 +2401,11 @@ class LLMPlacementSolverWithTP:
         # $/token = ($/hour) / (tokens/sec × sec/hour)
         if throughput_per_sec > 0:
             cost_per_token = cost_per_hour / (throughput_per_sec * 3600)
+            # Total runtime in hours
+            total_runtime_hours = self.config.total_tokens_to_process / (throughput_per_sec * 3600)
         else:
             cost_per_token = float('inf')
+            total_runtime_hours = float('inf')
         
         # $/M tokens for display
         cost_per_million_tokens = cost_per_token * 1_000_000
@@ -2421,6 +2442,7 @@ class LLMPlacementSolverWithTP:
         logger.info(f"  Throughput: {throughput_per_sec:.2f} tokens/sec")
         logger.info(f"  Cost: ${cost_per_hour:.2f}/hour")
         logger.info(f"  $/M tokens: ${cost_per_million_tokens:.6f}")
+        logger.info(f"  Total Runtime: {total_runtime_hours:.2f} hours ({total_runtime_hours/24:.2f} days)")
         
         self.solution = {
             'objective_value': self.model.ObjVal,
@@ -2428,6 +2450,7 @@ class LLMPlacementSolverWithTP:
             'throughput_tokens_per_sec': throughput_per_sec,
             'cost_per_hour': cost_per_hour,
             'cost_per_token': cost_per_token,
+            'total_runtime_hours': total_runtime_hours,
             'meets_cost_threshold': cost_per_token <= self.config.max_cost_per_token,
             'tp_configuration': self.tp_max_configuration,
             'gpu_assignments': [],
@@ -2905,6 +2928,8 @@ class LLMPlacementSolverWithTP:
         logger.info(f"  Cost:              ${self.solution['cost_per_hour']:.2f}/hour")
         cost_per_million = self.solution['cost_per_token'] * 1_000_000
         logger.info(f"  $/M tokens:        ${cost_per_million:.6f}")
+        total_runtime_hours = self.solution.get('total_runtime_hours', 0)
+        logger.info(f"  Total Runtime:     {total_runtime_hours:.2f} hours ({total_runtime_hours/24:.2f} days)")
         logger.info(f"  Objective Value:   {self.solution['objective_value']:.4f}")
         print()
         
@@ -2924,6 +2949,23 @@ class LLMPlacementSolverWithTP:
                 logger.info(f"  Improvement:            OK {improvement:.1f}% BETTER")
             else:
                 logger.info(f"  Improvement:            Nah {abs(improvement):.1f}% WORSE")
+            print()
+        
+        # Runtime constraint check (if specified)
+        if self.config.max_total_runtime_hours < 999999.0:
+            max_runtime = self.config.max_total_runtime_hours
+            actual_runtime = self.solution.get('total_runtime_hours', 0)
+            slack = max_runtime - actual_runtime
+            slack_pct = (slack / max_runtime) * 100 if max_runtime > 0 else 0
+            
+            logger.info("RUNTIME CONSTRAINT CHECK:")
+            logger.info("-" * 100)
+            logger.info(f"  Max Runtime Allowed:    {max_runtime:.2f} hours ({max_runtime/24:.2f} days)")
+            logger.info(f"  Actual Runtime:         {actual_runtime:.2f} hours ({actual_runtime/24:.2f} days)")
+            if slack > 0:
+                logger.info(f"  Slack:                  OK {slack:.2f} hours ({slack_pct:.1f}% under limit)")
+            else:
+                logger.info(f"  Slack:                  VIOLATED by {abs(slack):.2f} hours ({abs(slack_pct):.1f}% over limit)")
             print()
         
         print()
