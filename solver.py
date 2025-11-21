@@ -45,7 +45,10 @@ class GPUType:
 @dataclass
 class Config:
     """Runtime configuration - all parameters are required"""
+    # Workload phase (NEW: for prefill/decode disaggregation)
+    workload_phase: str  # 'prefill' or 'decode'
     sequence_length: int
+    output_length: int  # NEW: for decode phase (tokens to generate)
     min_batch_size: int
     max_batch_size: int
     model_name: str
@@ -72,6 +75,7 @@ class Config:
     throughput_normalization: float
     cost_normalization: float
     total_tokens_to_process: int
+    max_total_runtime_hours: float
     max_total_runtime_hours: float
 
 # GPU performance tiers for hierarchy constraints
@@ -142,62 +146,86 @@ class ThroughputFunctions:
     @staticmethod
     def calculate_arithmetic_intensity(num_layers: int, batch_size: int, seq_len: int, 
                                       d_model: int, d_hidden: int, bytes_per_element: int,
-                                      tp_degree: int = 1) -> float:
+                                      tp_degree: int = 1, phase: str = 'prefill') -> float:
         """
         Calculate arithmetic intensity (FLOPs / Byte) using roofline model.
         Higher AI = more compute-bound, lower AI = more memory-bound.
         
+        PHASE-AWARE: Prefill (O(n²)) vs Decode (O(n)) have very different AI!
+        
         Args:
             num_layers: Number of transformer layers in segment
             batch_size: Batch size
-            seq_len: Sequence length
+            seq_len: Sequence length (or KV cache length for decode)
             d_model: Model hidden dimension
             d_hidden: FFN intermediate dimension
             bytes_per_element: Bytes per element (2 for FP16, 4 for FP32)
             tp_degree: Tensor parallelism degree
+            phase: 'prefill' or 'decode'
         
         Returns:
             Arithmetic intensity in FLOPs per byte
         """
-        # === FLOPs Calculation (for full batch) ===
-        # Attention: Q, K, V, O projections (4 × 2D²) + attention scores (4D×seq)
-        # CRITICAL: Must multiply by batch_size AND seq_len for total FLOPs!
-        flops_attn_proj = 4 * 2 * batch_size * seq_len * d_model * d_model  # 4 projections
-        flops_attn_scores = 4 * batch_size * seq_len * seq_len * d_model  # QK^T + softmax*V
-        flops_attention = flops_attn_proj + flops_attn_scores
+        # === FLOPs Calculation (PHASE-AWARE) ===
+        if phase == 'prefill':
+            # PREFILL: Process all tokens at once (O(n²) attention)
+            flops_attn_proj = 4 * 2 * batch_size * seq_len * d_model * d_model  # 4 projections
+            flops_attn_scores = 4 * batch_size * seq_len * seq_len * d_model  # QK^T + softmax*V (O(n²))
+            flops_attention = flops_attn_proj + flops_attn_scores
+            
+            # FFN for all tokens
+            flops_ffn = 2 * batch_size * seq_len * (
+                d_model * d_hidden +
+                d_model * d_hidden +
+                d_hidden * d_model
+            )
+        else:  # decode
+            # DECODE: Generate ONE token (O(n) attention to KV cache)
+            # CRITICAL: KV cache grows during generation - use average for realistic estimate
+            # Note: This function doesn't have output_length parameter, so we can't account for growth
+            # The caller (gpu_throughput_with_tp) handles this properly
+            kv_cache_len = seq_len  # seq_len represents cached context
+            flops_attn_proj = 4 * 2 * batch_size * 1 * d_model * d_model  # QKV+O for 1 token
+            flops_attn_scores = 4 * batch_size * 1 * kv_cache_len * d_model  # Attend to cache (O(n))
+            flops_attention = flops_attn_proj + flops_attn_scores
+            
+            # FFN for 1 token
+            flops_ffn = 2 * batch_size * 1 * (
+                d_model * d_hidden +
+                d_model * d_hidden +
+                d_hidden * d_model
+            )
         
-        # FFN: typically 3 projections (up, down, gate) for SwiGLU
-        # up: D→d_hidden, gate: D→d_hidden, down: d_hidden→D
-        flops_ffn = 2 * batch_size * seq_len * (
-            d_model * d_hidden +  # up projection
-            d_model * d_hidden +  # gate projection
-            d_hidden * d_model    # down projection
-        )
-        
-        # Total FLOPs for the segment (already includes batch_size and seq_len)
         flops_per_layer = flops_attention + flops_ffn
         total_flops = flops_per_layer * num_layers
         
-        # === Memory Access Calculation (for full batch) ===
-        # Weights (divided by TP): (4D² for attention + 3D×d_hidden for FFN) per layer
+        # === Memory Access Calculation (PHASE-AWARE) ===
+        # Weights (divided by TP): same for both phases
         bytes_weights_per_layer = (
-            4 * d_model * d_model +  # Attention projections (Q, K, V, O)
-            3 * d_model * d_hidden   # FFN projections (up, gate, down)
+            4 * d_model * d_model +
+            3 * d_model * d_hidden
         ) * bytes_per_element / tp_degree
         
-        # KV cache per layer: 2 (K+V) × batch × seq_len × D (sharded by TP)
-        bytes_kv_cache_per_layer = 2 * batch_size * seq_len * d_model * bytes_per_element / tp_degree
+        if phase == 'prefill':
+            # KV cache being written
+            bytes_kv_cache_per_layer = 2 * batch_size * seq_len * d_model * bytes_per_element / tp_degree
+            # Activations for all tokens
+            bytes_activations_per_layer = batch_size * seq_len * d_model * bytes_per_element
+        else:  # decode
+            # KV cache being READ (full cached context!)
+            # Note: This function doesn't have output_length, so can't account for growth
+            # The caller (gpu_throughput_with_tp) should pass adjusted seq_len if needed
+            kv_cache_len = seq_len
+            bytes_kv_cache_per_layer = 2 * batch_size * kv_cache_len * d_model * bytes_per_element / tp_degree
+            # Activations for 1 token only
+            bytes_activations_per_layer = batch_size * 1 * d_model * bytes_per_element
         
-        # Activations per layer: batch × seq × hidden
-        bytes_activations_per_layer = batch_size * seq_len * d_model * bytes_per_element
-        
-        # Total memory access for the full batch
         bytes_per_layer = bytes_weights_per_layer + bytes_kv_cache_per_layer + bytes_activations_per_layer
         total_bytes = bytes_per_layer * num_layers
         
         # Arithmetic Intensity = FLOPs / Bytes
         if total_bytes == 0:
-            return float('inf')  # Edge case: no memory access
+            return float('inf')
         
         return total_flops / total_bytes
     
@@ -267,8 +295,10 @@ class ThroughputFunctions:
         
         # === Roofline Model Analysis ===
         # Calculate arithmetic intensity (FLOPs per byte)
+        # Note: This function is deprecated in favor of gpu_throughput_with_tp
+        # Default to 'prefill' for backward compatibility
         arithmetic_intensity = ThroughputFunctions.calculate_arithmetic_intensity(
-            num_layers, batch_size, seq_len, d_model, d_hidden, bytes_per_element, tp_degree=1
+            num_layers, batch_size, seq_len, d_model, d_hidden, bytes_per_element, tp_degree=1, phase='prefill'
         )
         
         # Get ridge point for this GPU
@@ -322,7 +352,7 @@ class ThroughputFunctions:
     def gpu_throughput_with_tp(gpu_type: str, seq_len: int, batch_size: int, 
                                num_layers: int, d_model: int, bytes_per_element: int, 
                                tp_degree: int, d_hidden: int = None, nvlink_bw_gbps: float = 300.0,
-                               debug: bool = False) -> float:
+                               debug: bool = False, phase: str = 'prefill', output_length: int = 0) -> float:
         """
         GPU throughput with tensor parallelism using roofline model.
         
@@ -332,9 +362,13 @@ class ThroughputFunctions:
         - Purpose: fit larger models in memory, NOT increase throughput
         - Throughput effect: minor speedup from reduced memory pressure, offset by communication
         
+        NEW: Phase-aware throughput modeling (prefill vs decode)
+        - Prefill: O(n²) attention on full prompt (all tokens processed in parallel)
+        - Decode: O(n) attention per token (sequential generation, one token at a time)
+        
         Args:
             gpu_type: GPU type name
-            seq_len: Sequence length
+            seq_len: Sequence length (for prefill) OR KV cache length (for decode)
             batch_size: Batch size
             num_layers: Number of layers in segment
             d_model: Model hidden dimension
@@ -343,6 +377,7 @@ class ThroughputFunctions:
             d_hidden: FFN intermediate dimension (defaults to 4*d_model)
             nvlink_bw_gbps: NVLink bandwidth in GB/s (from network topology, NOT hardcoded)
             debug: Enable debug logging
+            phase: 'prefill' or 'decode' (NEW)
         
         Returns:
             Throughput in tokens/second with TP (NOT multiplied by tp_degree!)
@@ -359,9 +394,9 @@ class ThroughputFunctions:
             logger.info(f"  GPU: {gpu_type}, TP={tp_degree}, batch={batch_size}, seq={seq_len}, layers={num_layers}")
             logger.info(f"  d_model={d_model}, d_hidden={d_hidden}, nvlink_bw={nvlink_bw_gbps} GB/s")
         
-        # === Roofline Model Analysis with TP ===
+        # === Roofline Model Analysis with TP (PHASE-AWARE) ===
         arithmetic_intensity = ThroughputFunctions.calculate_arithmetic_intensity(
-            num_layers, batch_size, seq_len, d_model, d_hidden, bytes_per_element, tp_degree
+            num_layers, batch_size, seq_len, d_model, d_hidden, bytes_per_element, tp_degree, phase
         )
         
         ridge_point = ThroughputFunctions.get_ridge_point(gpu_type)
@@ -373,17 +408,43 @@ class ThroughputFunctions:
             logger.info(f"  Regime: {regime}")
         
         # === Compute FLOPs PER GPU (with TP, each GPU does less compute) ===
-        # Attention projections: each GPU computes D/tp × D/tp matmuls
-        # Total FLOPs reduced by 1/tp in column dimension
-        attn_proj_flops = 2 * 4 * batch_size * seq_len * d_model * (d_model / tp_degree)  # QKV + output
-        attn_score_flops = 4 * batch_size * seq_len * seq_len * (d_model / tp_degree)  # Heads are sharded
+        # PHASE-AWARE computation: prefill vs decode have different complexity
         
-        # FFN: each GPU computes smaller matmuls (d_hidden sharded by tp)
-        ffn_flops = 2 * batch_size * seq_len * (
-            d_model * (d_hidden / tp_degree) +  # up projection
-            d_model * (d_hidden / tp_degree) +  # gate projection  
-            (d_hidden / tp_degree) * d_model    # down projection
-        )
+        if phase == 'prefill':
+            # PREFILL: Process all tokens in prompt at once (O(n²) attention)
+            attn_proj_flops = 2 * 4 * batch_size * seq_len * d_model * (d_model / tp_degree)  # QKV + output
+            attn_score_flops = 4 * batch_size * seq_len * seq_len * (d_model / tp_degree)  # O(n²) !!!
+            
+            # FFN for all tokens
+            ffn_flops = 2 * batch_size * seq_len * (
+                d_model * (d_hidden / tp_degree) +
+                d_model * (d_hidden / tp_degree) +
+                (d_hidden / tp_degree) * d_model
+            )
+        
+        else:  # phase == 'decode'
+            # DECODE: Generate ONE token at a time (O(n) attention)
+            # CRITICAL: KV cache grows from seq_len to seq_len+output_length during generation!
+            # We model the AVERAGE case for realistic throughput estimation
+            
+            if output_length > 0:
+                # Use average KV cache length over the generation process
+                # Cache grows: seq_len, seq_len+1, ..., seq_len+output_length-1
+                # Average = seq_len + (output_length - 1) / 2
+                avg_kv_cache_len = seq_len + (output_length - 1) / 2.0
+            else:
+                # Fallback: use initial cache length (for single-token generation)
+                avg_kv_cache_len = seq_len
+            
+            attn_proj_flops = 2 * 4 * batch_size * 1 * d_model * (d_model / tp_degree)  # QKV for 1 token
+            attn_score_flops = 4 * batch_size * 1 * avg_kv_cache_len * (d_model / tp_degree)  # O(n) with growing cache
+            
+            # FFN for 1 token
+            ffn_flops = 2 * batch_size * 1 * (
+                d_model * (d_hidden / tp_degree) +
+                d_model * (d_hidden / tp_degree) +
+                (d_hidden / tp_degree) * d_model
+            )
         
         flops_per_layer = attn_proj_flops + attn_score_flops + ffn_flops
         total_flops_per_gpu = num_layers * flops_per_layer
@@ -393,13 +454,28 @@ class ThroughputFunctions:
             logger.info(f"  Total FLOPs (×{num_layers} layers): {total_flops_per_gpu:.2e}")
         
         # === Compute Memory Access PER GPU (weights sharded by TP) ===
-        # Weights are sharded across TP GPUs
+        # PHASE-AWARE memory access patterns
+        
+        # Weights are sharded across TP GPUs (same for both phases)
         weight_bytes = num_layers * (4 * d_model * (d_model / tp_degree) + 
                                      3 * d_model * (d_hidden / tp_degree)) * bytes_per_element
         
-        # KV cache is also sharded along hidden dimension
-        activation_bytes = batch_size * seq_len * d_model * bytes_per_element
-        kv_cache_bytes = num_layers * 2 * batch_size * seq_len * (d_model / tp_degree) * bytes_per_element
+        if phase == 'prefill':
+            # PREFILL: Activations for all tokens
+            activation_bytes = batch_size * seq_len * d_model * bytes_per_element
+            # KV cache being written (sharded)
+            kv_cache_bytes = num_layers * 2 * batch_size * seq_len * (d_model / tp_degree) * bytes_per_element
+        
+        else:  # phase == 'decode'
+            # DECODE: Activation for 1 token
+            activation_bytes = batch_size * 1 * d_model * bytes_per_element
+            # CRITICAL: Must READ entire KV cache (which grows during generation!)
+            # Use average cache length for realistic estimation
+            if output_length > 0:
+                avg_kv_cache_len = seq_len + (output_length - 1) / 2.0
+            else:
+                avg_kv_cache_len = seq_len
+            kv_cache_bytes = num_layers * 2 * batch_size * avg_kv_cache_len * (d_model / tp_degree) * bytes_per_element
         
         total_bytes_per_gpu = weight_bytes + activation_bytes + kv_cache_bytes
         
@@ -413,7 +489,12 @@ class ThroughputFunctions:
             base_time_per_batch = total_bytes_per_gpu / (specs['mem_bw'] * 1e9 * specs['efficiency'])
         
         # === Communication Overhead (compute before applying TP efficiency) ===
-        activation_size_bytes = batch_size * seq_len * d_model * bytes_per_element
+        # PHASE-AWARE communication (all-reduce of activations)
+        if phase == 'prefill':
+            activation_size_bytes = batch_size * seq_len * d_model * bytes_per_element
+        else:  # decode
+            activation_size_bytes = batch_size * 1 * d_model * bytes_per_element  # 1 token
+        
         comm_time_per_layer = 2 * activation_size_bytes / (nvlink_bw_gbps * 1e9) * (tp_degree - 1) / tp_degree
         total_comm_time = num_layers * comm_time_per_layer
         
@@ -456,7 +537,14 @@ class ThroughputFunctions:
         # Total time = compute/memory time + communication time
         total_time = time_per_batch + total_comm_time
         
-        tokens_per_batch = batch_size * seq_len
+        # PHASE-AWARE throughput calculation
+        if phase == 'prefill':
+            # Prefill: Process batch_size × seq_len tokens in one forward pass
+            tokens_per_batch = batch_size * seq_len
+        else:  # decode
+            # Decode: Generate batch_size × 1 tokens per forward pass (sequential)
+            tokens_per_batch = batch_size * 1
+        
         base_throughput = tokens_per_batch / total_time
         
         batch_eff = ThroughputFunctions.batch_efficiency_factor(batch_size)
@@ -800,8 +888,21 @@ class LLMPlacementSolverWithTP:
         else:
             raise ValueError("Config must specify either 'optimization_priority' or 'cost_throughput_weight'")
         
+        # Load workload phase (NEW: prefill/decode disaggregation)
+        workload_phase = config_dict.get('workload_phase', 'prefill').lower()
+        if workload_phase not in ['prefill', 'decode']:
+            raise ValueError(f"Invalid workload_phase: '{workload_phase}'. Must be 'prefill' or 'decode'")
+        logger.info(f"Workload phase: {workload_phase}")
+        
+        # Load output_length (NEW: for decode phase)
+        output_length = int(config_dict.get('output_length', 0))
+        if workload_phase == 'decode' and output_length == 0:
+            logger.warning("Decode phase with output_length=0! This may indicate misconfiguration.")
+        
         return Config(
+            workload_phase=workload_phase,
             sequence_length=int(config_dict['sequence_length']),
+            output_length=output_length,
             min_batch_size=int(config_dict['min_batch_size']),
             max_batch_size=int(config_dict['max_batch_size']),
             model_name=config_dict['model_name'],
@@ -1010,29 +1111,59 @@ class LLMPlacementSolverWithTP:
         """
         Calculate peak activation memory per GPU with TP.
         Accounts for all-reduce operations and KV cache sharding.
+        
+        NEW: Phase-aware memory calculation (prefill vs decode)
+        - Prefill: Activations for all tokens + KV cache being written
+        - Decode: Activations for 1 token + FULL KV cache being read (much larger!)
         """
         batch = batch_size if batch_size is not None else self.config.min_batch_size
-        seq_len = self.config.sequence_length
         hidden = self.config.d_model
         d_hidden = self.config.d_hidden
         bytes_per_elem = self.config.bytes_per_element
+        phase = self.config.workload_phase  # NEW: Get phase from config
+        
+        if phase == 'prefill':
+            # PREFILL: Process all tokens in prompt
+            seq_len = self.config.sequence_length
+            
+            # Sharded intermediate tensors during computation
+            qkv_memory = (3 * batch * seq_len * (hidden / tp_degree) *
+                         bytes_per_elem) / (1024**3)
+            mlp_intermediate = (batch * seq_len * (4 * hidden / tp_degree) *
+                               bytes_per_elem) / (1024**3)
+            sharded_computation = qkv_memory + mlp_intermediate
 
-        # Sharded intermediate tensors during computation
-        qkv_memory = (3 * batch * seq_len * (hidden / tp_degree) *
-                     bytes_per_elem) / (1024**3)
-        mlp_intermediate = (batch * seq_len * (4 * hidden / tp_degree) *
-                           bytes_per_elem) / (1024**3)
-        sharded_computation = qkv_memory + mlp_intermediate
+            # Full activation tensor after all-reduce (NOT sharded)
+            full_activation = (batch * seq_len * hidden * bytes_per_elem) / (1024**3)
 
-        # Full activation tensor after all-reduce (NOT sharded)
-        full_activation = (batch * seq_len * hidden * bytes_per_elem) / (1024**3)
+            # KV cache being written (sharded)
+            kv_cache = (2 * batch * seq_len * (hidden / tp_degree) *
+                       bytes_per_elem) / (1024**3)
 
-        # KV cache: Persistently sharded along hidden dimension
-        kv_cache = (2 * batch * seq_len * (hidden / tp_degree) *
-                   bytes_per_elem) / (1024**3)
+            # Peak memory
+            peak_activation = max(sharded_computation, full_activation) + kv_cache
+        
+        else:  # phase == 'decode'
+            # DECODE: Generate 1 token at a time
+            kv_cache_len = self.config.sequence_length  # Context length from prefill
+            
+            # Sharded intermediate tensors for 1 token
+            qkv_memory = (3 * batch * 1 * (hidden / tp_degree) *
+                         bytes_per_elem) / (1024**3)
+            mlp_intermediate = (batch * 1 * (4 * hidden / tp_degree) *
+                               bytes_per_elem) / (1024**3)
+            sharded_computation = qkv_memory + mlp_intermediate
 
-        # Peak memory: max of computation phase vs all-reduce output phase, plus KV cache
-        peak_activation = max(sharded_computation, full_activation) + kv_cache
+            # Full activation for 1 token after all-reduce
+            full_activation = (batch * 1 * hidden * bytes_per_elem) / (1024**3)
+
+            # CRITICAL: Must store FULL KV cache from prefill (sharded)
+            # This is persistent and can be HUGE!
+            kv_cache = (2 * batch * kv_cache_len * (hidden / tp_degree) *
+                       bytes_per_elem) / (1024**3)
+
+            # Peak memory
+            peak_activation = max(sharded_computation, full_activation) + kv_cache
 
         # Framework overhead (15%)
         total_with_overhead = peak_activation * 1.15
@@ -1141,7 +1272,8 @@ class LLMPlacementSolverWithTP:
                                 throughput = ThroughputFunctions.gpu_throughput_with_tp(
                                     gpu_type, self.config.sequence_length,
                                     batch_size, segment_size, self.config.d_model,
-                                    self.config.bytes_per_element, tp_degree, self.config.d_hidden, nvlink_bw
+                                    self.config.bytes_per_element, tp_degree, self.config.d_hidden, nvlink_bw,
+                                    debug=False, phase=self.config.workload_phase
                                 )
                                 # Store in dictionary for O(1) lookup later
                                 if not hasattr(self, 'segment_throughputs_temp'):
@@ -1173,7 +1305,8 @@ class LLMPlacementSolverWithTP:
             recalculated = ThroughputFunctions.gpu_throughput_with_tp(
                 gpu_type, self.config.sequence_length,
                 batch_size, segment_size, self.config.d_model,
-                self.config.bytes_per_element, tp_degree, self.config.d_hidden, nvlink_bw
+                self.config.bytes_per_element, tp_degree, self.config.d_hidden, nvlink_bw,
+                debug=False, phase=self.config.workload_phase
             )
             if precomputed is None:
                 logger.error(f"  ✗ Missing pre-computed value for segment: {seg}")
@@ -1273,6 +1406,10 @@ class LLMPlacementSolverWithTP:
         """
         Pre-compute network throughput in tokens/sec.
         Models 3-stage pipeline: all-reduce (source) → inter-stage transfer → all-scatter (dest)
+        
+        NEW: Phase-aware inter-stage communication
+        - Prefill: Transfer batch_size × seq_len × d_model (all tokens)
+        - Decode: Transfer batch_size × 1 × d_model (1 token per forward pass)
         """
         gpu_pair_throughputs = {}
         
@@ -1283,14 +1420,20 @@ class LLMPlacementSolverWithTP:
             gpu_set1 = seg1[1]
             gpu_set2 = seg2[1]
             tp_degree1 = seg1[2]
-            tp_degree2 = seg2[2]
+            tp_degree2 = seg1[2]
             batch_size1 = seg1[6]
             batch_size2 = seg2[6]
             
-            # Full tensor size after all-reduce (NOT sharded)
+            # PHASE-AWARE: Tensor size depends on workload phase
             # NOTE: batch_size1 should equal batch_size2 due to global constraint
-            tensor_size_gb = (batch_size1 * self.config.sequence_length *
-                            self.config.d_model * self.config.bytes_per_element) / (1024**3)
+            if self.config.workload_phase == 'prefill':
+                # Prefill: Transfer activations for all tokens in the sequence
+                tensor_size_gb = (batch_size1 * self.config.sequence_length *
+                                self.config.d_model * self.config.bytes_per_element) / (1024**3)
+            else:  # decode
+                # Decode: Transfer activations for 1 token only (sequential generation)
+                tensor_size_gb = (batch_size1 * 1 *
+                                self.config.d_model * self.config.bytes_per_element) / (1024**3)
             
             # Step 1: All-reduce within source TP group (ring all-reduce)
             if tp_degree1 > 1:
@@ -1339,8 +1482,11 @@ class LLMPlacementSolverWithTP:
             # Time to transfer one batch (seconds)
             if effective_bandwidth_gbps > 0:
                 transfer_time_sec = tensor_size_gb / effective_bandwidth_gbps
-                # Throughput in tokens/sec
-                tokens_per_batch = batch_size1 * self.config.sequence_length
+                # PHASE-AWARE: Throughput in tokens/sec
+                if self.config.workload_phase == 'prefill':
+                    tokens_per_batch = batch_size1 * self.config.sequence_length
+                else:  # decode
+                    tokens_per_batch = batch_size1 * 1  # 1 token per forward pass
                 throughput = tokens_per_batch / transfer_time_sec
             else:
                 throughput = 1e9  # Infinite throughput if no communication needed
@@ -1667,7 +1813,8 @@ class LLMPlacementSolverWithTP:
                 max_throughput = ThroughputFunctions.gpu_throughput_with_tp(
                     gpu_type, self.config.sequence_length,
                     self.config.max_batch_size, max_size, self.config.d_model, 
-                    self.config.bytes_per_element, tp_degree, self.config.d_hidden, nvlink_bw
+                    self.config.bytes_per_element, tp_degree, self.config.d_hidden, nvlink_bw,
+                    debug=False, phase=self.config.workload_phase
                 )
                 throughput_by_type[gpu_type] = max_throughput
                 max_throughput_global = max(max_throughput_global, max_throughput)
@@ -2601,10 +2748,11 @@ class LLMPlacementSolverWithTP:
             tp_degree = assignment['tp_degree']
             segment_size = assignment['segment_size']
             
-            # Calculate arithmetic intensity for this segment
+            # Calculate arithmetic intensity for this segment (PHASE-AWARE)
             ai = ThroughputFunctions.calculate_arithmetic_intensity(
                 segment_size, optimal_batch, self.config.sequence_length,
-                self.config.d_model, self.config.d_hidden, self.config.bytes_per_element, tp_degree
+                self.config.d_model, self.config.d_hidden, self.config.bytes_per_element, tp_degree,
+                phase=self.config.workload_phase
             )
             
             # Get ridge point
@@ -2646,7 +2794,8 @@ class LLMPlacementSolverWithTP:
             
             ai = ThroughputFunctions.calculate_arithmetic_intensity(
                 segment_size, optimal_batch, self.config.sequence_length,
-                self.config.d_model, self.config.d_hidden, self.config.bytes_per_element, tp_degree
+                self.config.d_model, self.config.d_hidden, self.config.bytes_per_element, tp_degree,
+                phase=self.config.workload_phase
             )
             ridge_point = ThroughputFunctions.get_ridge_point(gpu_type)
             regime = ThroughputFunctions.determine_regime(ai, ridge_point)
@@ -2688,7 +2837,8 @@ class LLMPlacementSolverWithTP:
             
             ai = ThroughputFunctions.calculate_arithmetic_intensity(
                 segment_size, optimal_batch, self.config.sequence_length,
-                self.config.d_model, self.config.d_hidden, self.config.bytes_per_element, tp_degree
+                self.config.d_model, self.config.d_hidden, self.config.bytes_per_element, tp_degree,
+                phase=self.config.workload_phase
             )
             ridge_point = ThroughputFunctions.get_ridge_point(gpu_type)
             regime = ThroughputFunctions.determine_regime(ai, ridge_point)
@@ -2790,7 +2940,8 @@ class LLMPlacementSolverWithTP:
                     nvlink_bw = self._get_representative_tp_bandwidth(gpu_type, 4)
                     hyp_throughput = ThroughputFunctions.gpu_throughput_with_tp(
                         gpu_type, self.config.sequence_length, self.config.max_batch_size,
-                        5, self.config.d_model, self.config.bytes_per_element, 4, self.config.d_hidden, nvlink_bw
+                        5, self.config.d_model, self.config.bytes_per_element, 4, self.config.d_hidden, nvlink_bw,
+                        debug=False, phase=self.config.workload_phase
                     )
                     hyp_cost = gpu_obj.cost_per_hour * 4  # TP=4
                     logger.info(f"             Hypothetical (5 layers, TP=4): {hyp_throughput:.0f} tokens/s, ${hyp_cost:.2f}/h")
@@ -2835,7 +2986,8 @@ class LLMPlacementSolverWithTP:
             alt_throughput = ThroughputFunctions.gpu_throughput_with_tp(
                 best_gpu_type, self.config.sequence_length, self.config.max_batch_size,
                 self.config.num_decoder_layers, self.config.d_model, 
-                self.config.bytes_per_element, max_tp, self.config.d_hidden, nvlink_bw
+                self.config.bytes_per_element, max_tp, self.config.d_hidden, nvlink_bw,
+                debug=False, phase=self.config.workload_phase
             )
             alt_cost = best_gpu.cost_per_hour * max_tp
             alt_cost_per_token = alt_cost / (alt_throughput * 3600)
@@ -2893,7 +3045,8 @@ class LLMPlacementSolverWithTP:
                     t_alt = ThroughputFunctions.gpu_throughput_with_tp(
                         best_gpu_type, self.config.sequence_length, self.config.max_batch_size,
                         self.config.num_decoder_layers, self.config.d_model,
-                        self.config.bytes_per_element, max_tp, self.config.d_hidden, nvlink_bw
+                        self.config.bytes_per_element, max_tp, self.config.d_hidden, nvlink_bw,
+                        debug=False, phase=self.config.workload_phase
                     )
                     c_alt = best_gpu.cost_per_hour * max_tp
                     obj_alt = (t_alt / self.config.throughput_normalization) - \

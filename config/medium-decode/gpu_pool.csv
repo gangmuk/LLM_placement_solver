@@ -1,0 +1,5 @@
+gpu_type,count,memory_gb
+A100,8,80
+L40,12,48
+A10,12,24
+V100,12,32
