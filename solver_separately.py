@@ -108,20 +108,21 @@ class ThroughputFunctions:
 
     GPU_SPECS = {
         # Modern GPUs optimized for LLM inference (FP16/BF16 with modern tensor cores)
-        'H100': {'tflops': 989, 'mem_bw': 3350, 'efficiency': 0.70},  # Best for LLMs
-        'A100': {'tflops': 312, 'mem_bw': 2039, 'efficiency': 0.65},  # Excellent for LLMs
-        'L40S': {'tflops': 362, 'mem_bw': 864, 'efficiency': 0.58},   # Good Ada Lovelace
-        'A40': {'tflops': 150, 'mem_bw': 696, 'efficiency': 0.52},    # Ampere workstation
-        'L40': {'tflops': 181, 'mem_bw': 864, 'efficiency': 0.55},    # Ada Lovelace
-        
+        # efficiency: sustained fraction of peak (BW ~85% achievable, FLOPS ~70% for GEMM)
+        'H100': {'tflops': 989, 'mem_bw': 3350, 'efficiency': 0.87},  # Best for LLMs, excellent sustained BW
+        'A100': {'tflops': 312, 'mem_bw': 2039, 'efficiency': 0.85},  # Excellent sustained BW (HBM2e)
+        'L40S': {'tflops': 362, 'mem_bw': 864, 'efficiency': 0.82},   # Good Ada Lovelace (GDDR6X)
+        'A40': {'tflops': 150, 'mem_bw': 696, 'efficiency': 0.78},    # Ampere workstation (GDDR6X)
+        'L40': {'tflops': 181, 'mem_bw': 864, 'efficiency': 0.80},    # Ada Lovelace (GDDR6X)
+
         # Older GPUs - lower efficiency for modern LLM workloads
-        'V100': {'tflops': 125, 'mem_bw': 900, 'efficiency': 0.42},   # Volta - old tensor cores
-        'RTX4090': {'tflops': 165, 'mem_bw': 1008, 'efficiency': 0.50},
-        
+        'V100': {'tflops': 125, 'mem_bw': 900, 'efficiency': 0.75},   # Volta HBM2 - good BW, old tensor cores
+        'RTX4090': {'tflops': 165, 'mem_bw': 1008, 'efficiency': 0.80},
+
         # Budget GPUs
-        'L20': {'tflops': 119, 'mem_bw': 480, 'efficiency': 0.48},    # Budget Ada
-        'A10': {'tflops': 125, 'mem_bw': 600, 'efficiency': 0.45},    # Budget Ampere
-        'T4': {'tflops': 65, 'mem_bw': 320, 'efficiency': 0.38}       # Old Turing
+        'L20': {'tflops': 119, 'mem_bw': 480, 'efficiency': 0.78},    # Budget Ada
+        'A10': {'tflops': 125, 'mem_bw': 600, 'efficiency': 0.75},    # Budget Ampere
+        'T4': {'tflops': 65, 'mem_bw': 320, 'efficiency': 0.70}       # Old Turing
     }
 
     @staticmethod
@@ -1114,7 +1115,7 @@ class LLMPlacementSolverWithTP:
         # NEW: Runtime calibration knobs (optional)
         # real_world_efficiency: overall efficiency multiplier [0,1]
         # micro_batch_size: assumed micro-batch size for pipeline bubble model
-        real_world_efficiency = float(config_dict.get('real_world_efficiency', 0.30))
+        real_world_efficiency = float(config_dict.get('real_world_efficiency', 0.70))
         micro_batch_size = int(config_dict.get('micro_batch_size', 8))
         
         return Config(

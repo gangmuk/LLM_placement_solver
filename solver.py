@@ -933,7 +933,9 @@ class LLMPlacementSolverWithTP:
                  max_output_tokens: Optional[int] = None,
                  max_num_seqs: Optional[int] = None,
                  max_num_batched_tokens: Optional[int] = None,
-                 gpu_memory_utilization: Optional[float] = None):
+                 gpu_memory_utilization: Optional[float] = None,
+                 total_tokens_to_process: Optional[int] = None,
+                 max_total_runtime_hours: Optional[float] = None):
 
         def _read_gurobi_wls_file(wls_path: str) -> Dict[str, Union[str, int]]:
             if not os.path.exists(wls_path):
@@ -1019,6 +1021,11 @@ class LLMPlacementSolverWithTP:
             max_num_batched_tokens=max_num_batched_tokens,
             gpu_memory_utilization=gpu_memory_utilization,
         )
+        # Allow runtime overrides for SLO-driven placement
+        if total_tokens_to_process is not None:
+            self.config.total_tokens_to_process = total_tokens_to_process
+        if max_total_runtime_hours is not None:
+            self.config.max_total_runtime_hours = max_total_runtime_hours
         self.model = None
         self.solution = None
         self.solve_log = ""
@@ -5485,7 +5492,19 @@ class LLMPlacementSolverWithTP:
             valid_tp_degrees = [d for d in [1, 2, 4, 8]
                                if d <= gpus_per_instance and gpus_per_instance % d == 0]
 
+            # Fixed-size instances (only offered as 8-GPU by cloud provider):
+            # packing multiple PP stages per node is necessary.
+            # Variable-size families (g6e, g5, etc.): 1 PP stage per node,
+            # TP stays intra-node, PP crosses node boundaries.
+            FIXED_SIZE_PREFIXES = ('p3.', 'p3dn.', 'p4d.', 'p4de.', 'p5.', 'p5e.')
+            is_fixed_size = any(family.startswith(p) for p in FIXED_SIZE_PREFIXES)
+
             for tp_degree in valid_tp_degrees:
+                # Variable-size instances: skip if instance has more GPUs than TP needs
+                # (pick the right-sized instance instead of wasting GPUs)
+                if not is_fixed_size and gpus_per_instance != tp_degree:
+                    continue
+
                 # Calculate number of TP partitions per instance
                 partitions_per_instance = gpus_per_instance // tp_degree
 
@@ -5496,7 +5515,12 @@ class LLMPlacementSolverWithTP:
                     layers_per_stage = total_layers // pp_stages
 
                     # Calculate how many instances we need
-                    instances_needed = math.ceil(pp_stages / partitions_per_instance)
+                    if is_fixed_size:
+                        # Pack multiple PP stages per node (only option)
+                        instances_needed = math.ceil(pp_stages / partitions_per_instance)
+                    else:
+                        # 1 PP stage per node; gpus_per_instance == tp_degree
+                        instances_needed = pp_stages
 
                     if instances_needed > num_instances_available:
                         continue  # Not enough instances of this family
@@ -5664,6 +5688,16 @@ class LLMPlacementSolverWithTP:
                     # Calculate $/token
                     cost_per_token = total_cost_per_hour / (effective_throughput * 3600)
                     cost_per_million = cost_per_token * 1_000_000
+
+                    # --- SLO feasibility: reject configs that can't finish in time ---
+                    if self.config.max_total_runtime_hours < 999999.0:
+                        runtime_hours = self.config.total_tokens_to_process / (effective_throughput * 3600)
+                        if runtime_hours > self.config.max_total_runtime_hours:
+                            logger.info(
+                                f"  FILTERED: {family} TP={tp_degree} PP={pp_stages} "
+                                f"(runtime {runtime_hours:.2f}h > SLO {self.config.max_total_runtime_hours:.2f}h)"
+                            )
+                            continue
 
                     logger.debug(
                         f"  [{family} TP={tp_degree} PP={pp_stages}] "
