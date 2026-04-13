@@ -29,6 +29,7 @@ percentile is p90.
 | `our_experiment` | measured | Our vLLM 0.10.0 runs on AWS (L40S, A10G, L4) | ~69 |
 | `our_experiment_perfdb` | measured | Our vLLM 0.10.0 L40S profiling (wider IO range) | ~73 |
 | `splitwise` | measured | SplitwiseSim DGX profiling (A100, H100) from ISCA'24 | ~1260 |
+| `aiconfigurator` | measured | AiConfigurator vLLM sweep (A100, H100, H200, B200, GB200, L40S) | ~103,965 |
 
 ---
 
@@ -42,7 +43,7 @@ percentile is p90.
 | `data_source_type` | string | — | `measured`, `analytical`, or `simulated` | 100% |
 | `model_name` | string | — | HuggingFace model ID (e.g. `meta-llama/Llama-2-70b-hf`) | 100% |
 | `model_architecture` | string | — | HF architecture class (e.g. `LlamaForCausalLM`) | 100% |
-| `precision` | string | — | Weight precision: `fp8`, `fp16` | 100% |
+| `precision` | string | — | Weight precision: `fp4`, `fp8`, `fp16` | 100% |
 | `params_billion` | float | billions | Model parameter count from HF config | 100% |
 
 ### Parallelism
@@ -57,7 +58,7 @@ percentile is p90.
 
 | Column | Type | Unit | Description | Coverage |
 |---|---|---|---|---|
-| `gpu_model` | string | — | Canonical GPU name: `H100_SXM`, `H200`, `A100`, `A10G`, `L40S`, `L4`, `H100` | 100% |
+| `gpu_model` | string | — | Canonical GPU name: `H100_SXM`, `H200`, `H200_SXM`, `A100`, `A10G`, `L40S`, `L4`, `H100`, `B200`, `GB200` | 100% |
 | `gpu_count_total` | float | — | Total GPUs used (= tp * pp for most sources) | 99% |
 | `gpu_mem_gb` | float | GB | VRAM per GPU | 90% |
 | `num_nodes` | float | — | Number of physical nodes | our_experiment only |
@@ -183,7 +184,7 @@ Computed from `params_billion`, `precision`, `gpu_mem_gb`, `gpu_count_total`.
 
 | Column | Type | Unit | Description | Coverage |
 |---|---|---|---|---|
-| `model_size_gb` | float | GB | Weight footprint: `params_billion * bytes_per_param` (2 for fp16, 1 for fp8) | ~99% |
+| `model_size_gb` | float | GB | Weight footprint: `params_billion * bytes_per_param` (2 for fp16, 1 for fp8, 0.5 for fp4) | ~99% |
 | `params_per_gpu` | float | billions | `params_billion / gpu_count_total` | ~99% |
 | `model_fits_single_gpu` | bool | — | True if `model_size_gb <= gpu_mem_gb` | ~90% |
 | `vram_headroom_gb` | float | GB | `(gpu_mem_gb * gpu_count_total) - model_size_gb`. VRAM remaining after weights — the budget available for KV cache, CUDA graphs, activations, and framework overhead. Negative means weights alone exceed total VRAM. | ~90% |

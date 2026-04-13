@@ -171,6 +171,41 @@ GPU_SPECS = {
         "best_for": "largest models, maximum memory capacity, DGX deployments",
     },
 
+    # NVIDIA B200 SXM (Blackwell, standalone)
+    "B200": {
+        "name": "NVIDIA B200 SXM",
+        "architecture": "Blackwell",
+        "vram_gb": 192,
+        "fp16_tflops": 2250,  # Tensor Core dense; 4,500 with sparsity
+        "fp32_tflops": 150,
+        "memory_bandwidth_gbps": 8000,  # HBM3e, 8 TB/s
+        "nvlink": True,
+        "nvlink_bandwidth_gbps": 1800,  # NVLink 5.0
+        "pcie_gen": 5,
+        "tdp_watts": 1000,
+        "aws_instance_prefix": None,
+        "relative_performance": "next-gen flagship",
+        "best_for": "largest models, FP4 quantization, ultra-high throughput",
+    },
+
+    # NVIDIA GB200 (Grace Blackwell Superchip, ships in NVL72 rack)
+    # Per-GPU specs; same Blackwell die as B200 but higher power envelope in NVL72
+    "GB200": {
+        "name": "NVIDIA GB200 (Grace Blackwell Superchip)",
+        "architecture": "Blackwell",
+        "vram_gb": 192,
+        "fp16_tflops": 2250,  # Same die as B200; conservative until NVIDIA disambiguates
+        "fp32_tflops": 150,
+        "memory_bandwidth_gbps": 8000,
+        "nvlink": True,
+        "nvlink_bandwidth_gbps": 1800,
+        "pcie_gen": 6,  # Grace CPU uses PCIe 6 / NVLink-C2C
+        "tdp_watts": 1200,  # Higher TDP per GPU in NVL72
+        "aws_instance_prefix": None,
+        "relative_performance": "next-gen flagship",
+        "best_for": "NVL72 rack deployments, maximum scale inference",
+    },
+
     # NVIDIA A40 (various cloud providers)
     "A40": {
         "name": "NVIDIA A40",
